@@ -31,7 +31,7 @@ description: 通过 hapi_coding 工具调用远程 AI 编程助手（Claude Code
 
 如果用户不确定在哪个目录创建会话：
 1. `hapi_coding_list_machines` — 查看在线机器和最近使用的目录
-2. `hapi_coding_browse_directory` — 浏览机器上的目录结构
+2. `hapi_coding_list_session_paths` — 列出已有 session 的工作目录路径
 
 ## 关键规则
 

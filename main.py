@@ -186,15 +186,10 @@ class HapiConnectorPlugin(Star):
         async for result in self.llm_integration.tool_list_machines(event):
             yield result
 
-    @filter.llm_tool(name="hapi_coding_browse_directory")
-    async def tool_browse_directory(self, event: AstrMessageEvent, path: str, machine_id: str = ""):
-        '''浏览机器上的目录内容，用于创建会话前探索文件结构。
-
-        Args:
-            path(string): 要浏览的目录路径（如 /root、/home/user）
-            machine_id(string): 机器 ID（可选，单机器时自动选择）
-        '''
-        async for result in self.llm_integration.tool_browse_directory(event, path, machine_id):
+    @filter.llm_tool(name="hapi_coding_list_session_paths")
+    async def tool_list_session_paths(self, event: AstrMessageEvent):
+        '''列出所有已有 session 正在使用的工作目录路径，供创建新 session 时参考。'''
+        async for result in self.llm_integration.tool_list_session_paths(event):
             yield result
 
     @filter.llm_tool(name="hapi_coding_send_message")

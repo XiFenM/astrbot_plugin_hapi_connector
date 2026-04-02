@@ -4,7 +4,7 @@
 
 ### 会话创建失败
 - 检查 hapi 服务是否在线：用 `hapi_coding_list_sessions` 测试连接
-- 确认工作目录路径正确：用 `hapi_coding_browse_directory` 验证路径存在
+- 确认工作目录路径正确：用 `hapi_coding_list_session_paths` 查看已有 session 的工作目录作为参考
 - 确认 machine_id 正确：用 `hapi_coding_list_machines` 查看在线机器
 
 ### 消息发送无响应

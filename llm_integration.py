@@ -101,7 +101,7 @@ class LLMIntegration:
             "hapi_coding_create_session",
             "hapi_coding_send_message",
             "hapi_coding_list_machines",       # F12: 查看在线机器
-            "hapi_coding_browse_directory",    # F12: 浏览机器目录
+            "hapi_coding_list_session_paths",    # F12: 浏览机器目录
         }
 
         # 所有工具
@@ -118,7 +118,7 @@ class LLMIntegration:
             "hapi_coding_stop_message",
             "hapi_coding_execute_command",
             "hapi_coding_list_machines",       # F12
-            "hapi_coding_browse_directory",    # F12
+            "hapi_coding_list_session_paths",    # F12
         }
 
         # 决定要移除的工具
@@ -449,79 +449,30 @@ quick_prefix (快捷前缀): {quick_prefix}
 
         yield "\n".join(lines)
 
-    async def tool_browse_directory(self, event: AstrMessageEvent, path: str = "", machine_id: str = ""):
-        '''浏览机器上的目录内容，用于创建会话前探索文件结构。
-
-        Args:
-            path(string): 要浏览的目录路径（如 /root、/home/user）；留空则提示常用路径
-            machine_id(string): 机器 ID（可选，单机器时自动选择）
-        '''
-        if not path:
-            yield (
-                "请指定要浏览的目录路径，例如：\n"
-                "  /root\n"
-                "  /home/user\n"
-                "  /workspace\n"
-                "  /tmp"
-            )
+    async def tool_list_session_paths(self, event: AstrMessageEvent):
+        '''列出所有已有 session 正在使用的工作目录路径，供创建新 session 时参考。'''
+        if not self.sessions_cache:
+            yield "当前没有任何 session，无历史路径可参考。可直接指定工作目录（Claude Code 会自动创建不存在的目录）。"
             return
 
-        try:
-            machines = await session_ops.fetch_machines(self.client)
-        except Exception as e:
-            yield f"获取机器列表失败: {e}"
-            return
-
-        if not machines:
-            yield "没有在线的机器"
-            return
-
-        # 解析 machine_id
-        target_mid = machine_id.strip() if machine_id else ""
-        if not target_mid:
-            if len(machines) == 1:
-                target_mid = machines[0].get("id", "")
-            else:
-                lines = ["有多个机器在线，请指定 machine_id:"]
-                for m in machines:
-                    mid = m.get("id", "?")
-                    meta = m.get("metadata", {})
-                    host = meta.get("host", "unknown")
-                    lines.append(f"  - {mid[:12]}: {host}")
-                yield "\n".join(lines)
-                return
-
-        # 策略：借用该机器上已有的任意 session 来浏览目录
-        borrowed_sid = None
+        seen: set[str] = set()
+        lines = ["已有 session 的工作目录:"]
         for s in self.sessions_cache:
-            if s.get("machineId") == target_mid:
-                borrowed_sid = s.get("id")
-                break
+            meta = s.get("metadata", {})
+            path = meta.get("path", "")
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            name = meta.get("name", "") or s.get("id", "?")[:8]
+            host = meta.get("host", "")
+            suffix = f"  ({host})" if host else ""
+            lines.append(f"  {path}{suffix}  [{name}]")
 
-        if borrowed_sid:
-            try:
-                entries = await session_ops.list_directory(self.client, borrowed_sid, path=path)
-                if not entries:
-                    yield f"目录 {path} 为空或不存在"
-                    return
-                lines = [f"📂 {path} 的内容:"]
-                for e in entries[:30]:
-                    etype = e.get("type", "?")
-                    icon = "📁" if etype == "directory" else "📄"
-                    name = e.get("name", "?")
-                    lines.append(f"  {icon} {name}")
-                if len(entries) > 30:
-                    lines.append(f"  ... 还有 {len(entries) - 30} 项")
-                yield "\n".join(lines)
-            except Exception as e:
-                yield f"浏览目录失败: {e}"
-        else:
-            # 无可借用的 session，无法浏览目录（list_directory 依赖已有 session）
-            yield (
-                f"该机器上暂无活跃会话，无法浏览目录。\n"
-                f"请先创建一个会话，或直接指定工作目录路径（Claude Code 会自动创建不存在的目录）。\n"
-                f"常用路径参考：/root、/home/user、/workspace、/tmp"
-            )
+        if len(lines) == 1:
+            yield "已有 session 均无工作目录信息。可直接指定路径，Claude Code 会自动创建不存在的目录。"
+            return
+
+        yield "\n".join(lines)
 
     # ──── 操作类工具（需要审批）────
 
