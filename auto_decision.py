@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from astrbot.api import logger
 
 from . import approval_ops, session_ops
-from .formatters import extract_text_preview, is_question_request, session_label_short
+from .formatters import extract_text_preview, is_question_request, session_label_short, format_tool_args_readable
 
 
 @dataclass
@@ -105,7 +105,7 @@ class AutoDecisionManager:
                     "[AutoDecision] 置信度不足: confidence=%s, threshold=%d, reasoning=%s (sid=%s)",
                     confidence, threshold, reasoning, sid[:8],
                 )
-                if self.mode == "suggest" and reasoning:
+                if reasoning:
                     suggestion = self._format_suggestion(
                         sid, req, "escalate", reasoning, confidence, is_question=True,
                         answers=answers,
@@ -189,12 +189,10 @@ class AutoDecisionManager:
                     "[AutoDecision] 审批上报: action=%s, confidence=%s, threshold=%d, reasoning=%s (sid=%s)",
                     action, confidence, threshold, reasoning, sid[:8],
                 )
-                if self.mode == "suggest":
-                    suggestion = self._format_suggestion(
-                        sid, req, action, reasoning, confidence, is_question=False,
-                    )
-                    return DecisionResult(handled=False, suggestion_text=suggestion)
-                return DecisionResult(handled=False)
+                suggestion = self._format_suggestion(
+                    sid, req, action, reasoning, confidence, is_question=False,
+                )
+                return DecisionResult(handled=False, suggestion_text=suggestion)
 
             # ── suggest 模式：只给建议 ──
             if self.mode == "suggest":
@@ -210,7 +208,7 @@ class AutoDecisionManager:
                     logger.warning("[AutoDecision] 批准失败: %s (sid=%s)", msg, sid[:8])
                     return DecisionResult(handled=False)
                 self._record_decision(sid, f"工具: {tool}", "approve", reasoning)
-                await self._notify_user_approval(sid, req, "approve", reasoning)
+                await self._notify_user_approval(sid, req, "approve", reasoning, confidence)
                 logger.info("[AutoDecision] 自动批准 %s (sid=%s, confidence=%d)", tool, sid[:8], confidence)
                 return DecisionResult(handled=True)
 
@@ -220,7 +218,7 @@ class AutoDecisionManager:
                     logger.warning("[AutoDecision] 拒绝失败: %s (sid=%s)", msg, sid[:8])
                     return DecisionResult(handled=False)
                 self._record_decision(sid, f"工具: {tool}", "deny", reasoning)
-                await self._notify_user_approval(sid, req, "deny", reasoning)
+                await self._notify_user_approval(sid, req, "deny", reasoning, confidence)
                 logger.info("[AutoDecision] 自动拒绝 %s (sid=%s, confidence=%d)", tool, sid[:8], confidence)
                 return DecisionResult(handled=True)
 
@@ -693,17 +691,22 @@ class AutoDecisionManager:
 
         await self._plugin.sse_listener._push_notification("\n".join(lines), sid)
 
-    async def _notify_user_approval(self, sid: str, req: dict, action: str, reasoning: str):
+    async def _notify_user_approval(self, sid: str, req: dict, action: str, reasoning: str, confidence: int = 0):
         """通知用户自动审批的结果（auto 模式）。"""
         label = session_label_short(sid, self._plugin.sessions_cache)
         tool = req.get("tool", "unknown")
         action_text = "✅ 已自动批准" if action == "approve" else "❌ 已自动拒绝"
+        args = req.get("arguments", {})
+        readable = format_tool_args_readable(tool, args, max_len=100) if isinstance(args, dict) else ""
+        tool_line = f"  🔧 {tool}: {readable}" if readable else f"  🔧 工具: {tool}"
 
         lines = [
             f"🤖 [LLM 自动决策] {label}",
-            f"  🔧 工具: {tool}",
+            tool_line,
             f"  {action_text}",
         ]
+        if confidence > 0:
+            lines.append(f"  📊 置信度: {confidence}/10")
         if reasoning:
             lines.append(f"  💡 理由: {reasoning}")
 
@@ -744,8 +747,8 @@ class AutoDecisionManager:
         if reasoning:
             lines.append(f"  💬 理由: {reasoning}")
 
-        lines.append("")  # 空行分隔建议和原始通知
-        return "\n".join(lines)
+        lines.append("─" * 30)  # 分隔线区分建议和审批通知
+        return "\n".join(lines) + "\n"
 
     def _format_high_risk_warning(self, sid: str, req: dict) -> str:
         """格式化高风险操作警告（suggest 模式）。"""

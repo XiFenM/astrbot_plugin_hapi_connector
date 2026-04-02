@@ -120,6 +120,12 @@
     "type": "string",
     "default": "",
     "hint": "留空则发送到 session 绑定的窗口，填写窗口 ID 则强制发送到指定窗口"
+  },
+  "approval_timeout": {
+    "description": "LLM 工具审批超时时间（秒）",
+    "type": "int",
+    "default": 60,
+    "hint": "超时前 15 秒自动提醒用户，超时后直接通知用户并取消操作"
   }
 }
 

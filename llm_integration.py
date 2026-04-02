@@ -21,7 +21,7 @@ class LLMIntegration:
     # ──── 工具可见性控制 ────
 
     async def on_llm_request_hook(self, event: AstrMessageEvent, request: ProviderRequest):
-        """根据权限和窗口状态动态控制工具可见性"""
+        """根据权限和窗口状态动态控制工具可见性，并注入会话上下文"""
         # 1. 权限检查：非管理员移除所有工具
         is_admin = self.plugin._is_admin(event)
         if not is_admin:
@@ -33,6 +33,56 @@ class LLMIntegration:
         if not visible_sessions:
             self._remove_hapi_tools(request, keep_basic=True)
             return
+
+        # 3. F2/F3: 注入动态会话状态和能力信息到 LLM 系统提示
+        self._inject_session_context(request, visible_sessions, event)
+
+    async def _fetch_and_store_caps(self, sid: str):
+        """异步抓取并缓存会话的能力配置（fire-and-forget）"""
+        try:
+            caps = await session_ops.fetch_session_capabilities(self.client, sid)
+            self.state_mgr.set_capabilities(sid, caps)
+            logger.info("[caps] 已抓取会话能力 sid=%s skills=%d cmds=%d mcp=%d",
+                        sid[:8], len(caps.get("skills", [])),
+                        len(caps.get("slash_commands", [])),
+                        len(caps.get("mcp_servers", [])))
+        except Exception as e:
+            logger.warning("[caps] 抓取会话能力失败 sid=%s: %s", sid[:8], e)
+
+    def _inject_session_context(self, request: ProviderRequest,
+                                visible_sessions: list[dict],
+                                event):
+        """将当前会话状态和能力信息注入 LLM 系统提示"""
+        lines = ["\n[HAPI 当前状态]"]
+        for i, s in enumerate(visible_sessions[:5], 1):
+            sid = s.get("id", "?")
+            meta = s.get("metadata", {})
+            title = (meta.get("summary") or {}).get("text", "(无标题)")
+            flavor = meta.get("flavor", "?")
+            is_thinking = s.get("thinking", False)
+            is_active = s.get("active", False)
+            state = "thinking" if is_thinking else ("active" if is_active else "idle")
+            lines.append(f"  [{i}] {title[:30]} | {flavor} | {state} | {sid[:8]}")
+
+            # 附加能力摘要
+            caps = self.state_mgr.get_capabilities(sid)
+            if caps:
+                cap_parts = []
+                if caps.get("mcp_servers"):
+                    cap_parts.append(f"MCP: {', '.join(caps['mcp_servers'][:5])}")
+                if caps.get("skills"):
+                    names = [sk.get("name", "?") for sk in caps["skills"][:5]]
+                    cap_parts.append(f"Skills: {', '.join(names)}")
+                if caps.get("slash_commands"):
+                    names = [c.get("name", "?") for c in caps["slash_commands"][:5]]
+                    cap_parts.append(f"Commands: {', '.join(names)}")
+                if caps.get("claude_md_summary"):
+                    cap_parts.append(f"项目: {caps['claude_md_summary'][:100]}")
+                if cap_parts:
+                    lines.append(f"      能力: {' | '.join(cap_parts)}")
+
+        if hasattr(request, 'system_prompt'):
+            request.system_prompt = (request.system_prompt or "") + "\n".join(lines)
 
     def _remove_hapi_tools(self, request: ProviderRequest, keep_basic: bool = False):
         """移除所有 hapi_coding 工具
@@ -50,6 +100,8 @@ class LLMIntegration:
             "hapi_coding_execute_command",
             "hapi_coding_create_session",
             "hapi_coding_send_message",
+            "hapi_coding_list_machines",       # F12: 查看在线机器
+            "hapi_coding_browse_directory",    # F12: 浏览机器目录
         }
 
         # 所有工具
@@ -65,6 +117,8 @@ class LLMIntegration:
             "hapi_coding_change_config",
             "hapi_coding_stop_message",
             "hapi_coding_execute_command",
+            "hapi_coding_list_machines",       # F12
+            "hapi_coding_browse_directory",    # F12
         }
 
         # 决定要移除的工具
@@ -172,21 +226,46 @@ class LLMIntegration:
             logger.error(f"LLM 工具 {tool_name} 审批通知发送失败，自动拒绝")
             return False, "notification_failed"
 
-        # 等待审批结果（1分钟超时）
+        # 等待审批结果（可配置超时，两阶段：T-15s 提醒 + 超时直接通知）
+        timeout = max(5, self.plugin.config.get("approval_timeout", 60))
         try:
-            approved = await asyncio.wait_for(future, timeout=60)
-            return (True, "approved") if approved else (False, "denied")
+            if timeout > 15:
+                # 阶段 1：等待至 T-15 秒（shield 保护 future 不被 wait_for 取消）
+                try:
+                    approved = await asyncio.wait_for(asyncio.shield(future), timeout=timeout - 15)
+                    return (True, "approved") if approved else (False, "denied")
+                except asyncio.TimeoutError:
+                    # T-15 提醒
+                    try:
+                        await event.send(MessageChain().message(
+                            f"⏰ 审批提醒：{tool_name}\n15 秒后超时，请及时回复 /hapi a 批准或 /hapi deny 拒绝"
+                        ))
+                    except Exception:
+                        pass
+                # 阶段 2：最后 15 秒
+                approved = await asyncio.wait_for(future, timeout=15)
+                return (True, "approved") if approved else (False, "denied")
+            else:
+                approved = await asyncio.wait_for(future, timeout=timeout)
+                return (True, "approved") if approved else (False, "denied")
         except asyncio.TimeoutError:
             # 超时，清理请求
             self.pending_mgr.remove_entry(window_id, req_id)
-            logger.warning(f"LLM 工具 {tool_name} 审批超时（60秒无响应）")
+            logger.warning(f"LLM 工具 {tool_name} 审批超时（{timeout}秒无响应）")
             # 如果处于忙时托管时段，超时默认允许
             if self.plugin.sse_listener._auto_approve_enabled and self.plugin.sse_listener._in_auto_approve_window():
                 logger.info(f"忙时托管时段，自动批准 {tool_name}")
                 return True, "auto_approved"
+            # 直接通知用户（不经 LLM 转述）
+            try:
+                await event.send(MessageChain().message(
+                    f"⏰ 审批超时：{tool_name}\n已自动取消此操作。如需继续，请重新发起请求。"
+                ))
+            except Exception:
+                pass
             return False, "timeout"
         except asyncio.CancelledError:
-            # 任务被取消（通常是外部超时），清理并返回拒绝，不再传播异常
+            # 任务被取消，清理并返回拒绝，不再传播异常
             self.pending_mgr.remove_entry(window_id, req_id)
             logger.warning(f"LLM 工具 {tool_name} 审批被取消")
             return False, "cancelled"
@@ -339,6 +418,101 @@ quick_prefix (快捷前缀): {quick_prefix}
         '''
         yield formatters.get_help_text(topic)
 
+    async def tool_list_machines(self, event: AstrMessageEvent):
+        '''列出所有在线机器及其信息，以及最近使用过的工作目录。用于创建会话前了解可用环境。'''
+        try:
+            machines = await session_ops.fetch_machines(self.client)
+        except Exception as e:
+            yield f"获取机器列表失败: {e}"
+            return
+
+        if not machines:
+            yield "没有在线的机器"
+            return
+
+        lines = ["在线机器:"]
+        for m in machines:
+            mid = m.get("id", "?")
+            meta = m.get("metadata", {})
+            host = meta.get("host", "unknown")
+            plat = meta.get("platform", "?")
+            lines.append(f"  - {mid[:12]}: {host} ({plat})")
+
+        try:
+            recent = await session_ops.fetch_recent_paths(self.client)
+            if recent:
+                lines.append("\n最近使用过的工作目录:")
+                for p in recent[:10]:
+                    lines.append(f"  - {p}")
+        except Exception:
+            pass
+
+        yield "\n".join(lines)
+
+    async def tool_browse_directory(self, event: AstrMessageEvent, path: str, machine_id: str = ""):
+        '''浏览机器上的目录内容，用于创建会话前探索文件结构。
+
+        Args:
+            path(string): 要浏览的目录路径（如 /root、/home/user）
+            machine_id(string): 机器 ID（可选，单机器时自动选择）
+        '''
+        try:
+            machines = await session_ops.fetch_machines(self.client)
+        except Exception as e:
+            yield f"获取机器列表失败: {e}"
+            return
+
+        if not machines:
+            yield "没有在线的机器"
+            return
+
+        # 解析 machine_id
+        target_mid = machine_id.strip() if machine_id else ""
+        if not target_mid:
+            if len(machines) == 1:
+                target_mid = machines[0].get("id", "")
+            else:
+                lines = ["有多个机器在线，请指定 machine_id:"]
+                for m in machines:
+                    mid = m.get("id", "?")
+                    meta = m.get("metadata", {})
+                    host = meta.get("host", "unknown")
+                    lines.append(f"  - {mid[:12]}: {host}")
+                yield "\n".join(lines)
+                return
+
+        # 策略：借用该机器上已有的任意 session 来浏览目录
+        borrowed_sid = None
+        for s in self.sessions_cache:
+            if s.get("machineId") == target_mid:
+                borrowed_sid = s.get("id")
+                break
+
+        if borrowed_sid:
+            try:
+                entries = await session_ops.list_directory(self.client, borrowed_sid, path=path)
+                if not entries:
+                    yield f"目录 {path} 为空或不存在"
+                    return
+                lines = [f"📂 {path} 的内容:"]
+                for e in entries[:30]:
+                    etype = e.get("type", "?")
+                    icon = "📁" if etype == "directory" else "📄"
+                    name = e.get("name", "?")
+                    lines.append(f"  {icon} {name}")
+                if len(entries) > 30:
+                    lines.append(f"  ... 还有 {len(entries) - 30} 项")
+                yield "\n".join(lines)
+            except Exception as e:
+                yield f"浏览目录失败: {e}"
+        else:
+            # 无可借用的 session，尝试检测路径是否存在
+            exists = await session_ops.check_path_exists(self.client, target_mid, path)
+            if exists:
+                yield f"路径 {path} 存在，但该机器无活跃会话，无法列出目录内容。请先创建一个会话。"
+            else:
+                yield f"路径 {path} 不存在或无法访问"
+
     # ──── 操作类工具（需要审批）────
 
     # ──── send_message 辅助方法 ────
@@ -394,7 +568,7 @@ quick_prefix (快捷前缀): {quick_prefix}
         logger.debug(f"[tool_send_message] approved={approved}, reason={reason}")
         if not approved:
             if reason == "timeout":
-                yield "操作超时：60秒内未收到用户审批。请提醒用户使用 /hapi a 批准或 /hapi deny 拒绝。"
+                yield "操作已超时取消，已直接通知用户。"
             elif reason == "notification_failed":
                 yield "操作失败：无法发送审批通知到用户。请检查是否已绑定 session。"
             else:
@@ -450,7 +624,7 @@ quick_prefix (快捷前缀): {quick_prefix}
         approved, reason = await self._require_approval("hapi_coding_switch_session", {"target": target}, event)
         if not approved:
             if reason == "timeout":
-                yield "操作超时：60秒内未收到用户审批。请提醒用户使用 /hapi a 批准或 /hapi deny 拒绝。"
+                yield "操作已超时取消，已直接通知用户。"
             elif reason == "notification_failed":
                 yield "操作失败：无法发送审批通知到用户。请检查是否已绑定 session。"
             else:
@@ -535,7 +709,7 @@ quick_prefix (快捷前缀): {quick_prefix}
                                            approval_payload, event)
         if not approved:
             if reason == "timeout":
-                yield "操作超时：60秒内未收到用户审批。请提醒用户使用 /hapi a 批准或 /hapi deny 拒绝。"
+                yield "操作已超时取消，已直接通知用户。"
             elif reason == "notification_failed":
                 yield "操作失败：无法发送审批通知到用户。请检查是否已绑定 session。"
             else:
@@ -547,6 +721,8 @@ quick_prefix (快捷前缀): {quick_prefix}
         ok, msg, sid = await session_ops.spawn_session(self.client, machine_id, directory, agent, session_type, yolo, model_reasoning_effort=normalized_effort or None)
         if ok and sid:
             await self.state_mgr.capture_window(sid, event.unified_msg_origin, agent)
+            # F2: 异步抓取会话能力（不阻塞创建流程）
+            asyncio.create_task(self._fetch_and_store_caps(sid))
             logger.debug(f"[tool_create_session] success sid={sid[:8]}")
             yield f"✅ 已创建 session: {sid[:8]}"
         else:
@@ -565,7 +741,7 @@ quick_prefix (快捷前缀): {quick_prefix}
                                            {"config_name": config_name, "value": value}, event)
         if not approved:
             if reason == "timeout":
-                yield "操作超时：60秒内未收到用户审批。请提醒用户使用 /hapi a 批准或 /hapi deny 拒绝。"
+                yield "操作已超时取消，已直接通知用户。"
             elif reason == "notification_failed":
                 yield "操作失败：无法发送审批通知到用户。请检查是否已绑定 session。"
             else:
@@ -612,7 +788,7 @@ quick_prefix (快捷前缀): {quick_prefix}
         approved, reason = await self._require_approval("hapi_coding_stop_message", {"session_id": sid[:8]}, event)
         if not approved:
             if reason == "timeout":
-                yield "操作超时：60秒内未收到用户审批。请提醒用户使用 /hapi a 批准或 /hapi deny 拒绝。"
+                yield "操作已超时取消，已直接通知用户。"
             elif reason == "notification_failed":
                 yield "操作失败：无法发送审批通知到用户。请检查是否已绑定 session。"
             else:
@@ -635,7 +811,7 @@ quick_prefix (快捷前缀): {quick_prefix}
         approved, reason = await self._require_approval("hapi_coding_execute_command", {"command": command}, event)
         if not approved:
             if reason == "timeout":
-                yield "操作超时：60秒内未收到用户审批。请提醒用户使用 /hapi a 批准或 /hapi deny 拒绝。"
+                yield "操作已超时取消，已直接通知用户。"
             elif reason == "notification_failed":
                 yield "操作失败：无法发送审批通知到用户。请检查是否已绑定 session。"
             else:

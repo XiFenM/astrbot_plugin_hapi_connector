@@ -2,6 +2,14 @@
 
 import json
 
+# 应过滤的噪音消息/事件类型（用户无需感知）
+NOISE_BLOCK_TYPES = frozenset({
+    "token_count",       # token 统计
+    "thinking",          # 思考中标记
+    "rate_limit_event",  # API 限速事件
+    "ready",             # 就绪信号
+})
+
 
 def extract_text_preview(content: dict, max_len: int = 80) -> str | None:
     """从消息 content 中提取文本预览（通用，适配所有 agent）。
@@ -82,7 +90,7 @@ def _extract_from_block(block: dict, max_len: int) -> str | None:
     if btype == "event":
         event_data = block.get("data", {})
         event_type = event_data.get("type", "?") if isinstance(event_data, dict) else "?"
-        if event_type == "ready":
+        if event_type in NOISE_BLOCK_TYPES:
             return None
         # message 类型事件：提取实际消息内容（如 "Context was reset"）
         if event_type == "message" and isinstance(event_data, dict):
@@ -97,7 +105,7 @@ def _extract_from_block(block: dict, max_len: int) -> str | None:
         return f"[Summary]: {text[:max_len]}" if text else None
 
     # ── 跳过噪音 ──
-    if btype in ("token_count", "thinking"):
+    if btype in NOISE_BLOCK_TYPES:
         return None
 
     # ── 嵌套消息结构（如 {"role": "user", "content": [...]} ）──
@@ -173,13 +181,77 @@ def _fmt_tool_call(block: dict, max_len: int) -> str:
     if isinstance(inp, dict):
         if name == "TodoWrite":
             return _fmt_todo_write(inp)
-        cmd = inp.get("command", "")
-        if cmd:
-            return f"🛠️ {name}: {cmd[:max_len]}"
-        args_str = json.dumps(inp, ensure_ascii=False)[:max_len]
-        return f"🛠️ {name}: {args_str}"
+        readable = format_tool_args_readable(name, inp, max_len)
+        if readable:
+            return f"🛠️ {name}: {readable}"
     return f"🛠️ {name}"
 
+
+
+def format_tool_args_readable(tool: str, args: dict, max_len: int = 100) -> str:
+    """按工具类型定制展示参数，替代原始 json.dumps。
+
+    返回人类可读的参数摘要字符串。空字符串表示无有效参数。
+    """
+    if not isinstance(args, dict) or not args:
+        return ""
+
+    t = tool.lower() if tool else ""
+
+    if t == "write":
+        fp = args.get("file_path", "?")
+        basename = fp.rsplit("/", 1)[-1] if "/" in fp else fp
+        content = args.get("content", "")
+        if isinstance(content, str) and content:
+            line_count = content.count("\n") + 1
+            first_line = content.split("\n", 1)[0][:50]
+            return f"{basename} ({line_count}行, 首行: {first_line})"
+        return basename
+
+    if t == "edit":
+        fp = args.get("file_path", "?")
+        basename = fp.rsplit("/", 1)[-1] if "/" in fp else fp
+        old = args.get("old_string", "")[:30]
+        new = args.get("new_string", "")[:30]
+        if old or new:
+            return f'{basename}: "{old}" → "{new}"'
+        return basename
+
+    if t == "read":
+        return args.get("file_path", "?")
+
+    if t == "bash":
+        cmd = args.get("command", "")
+        if isinstance(cmd, str):
+            return cmd.replace("\n", " ")[:max_len]
+        return ""
+
+    if t == "glob":
+        pattern = args.get("pattern", "?")
+        path = args.get("path", "")
+        return f"{pattern} in {path}" if path else pattern
+
+    if t == "grep":
+        pattern = args.get("pattern", "?")
+        path = args.get("path", "")
+        return f"/{pattern}/ in {path}" if path else f"/{pattern}/"
+
+    if t == "agent":
+        desc = args.get("description", "") or args.get("prompt", "")
+        return str(desc)[:max_len]
+
+    if t == "todowrite":
+        return ""  # 由 _fmt_todo_write 单独处理
+
+    # 通用：前 3 个 key-value，值截断
+    items = list(args.items())[:3]
+    parts = []
+    for k, v in items:
+        v_str = str(v) if not isinstance(v, str) else v
+        if len(v_str) > 40:
+            v_str = v_str[:37] + "..."
+        parts.append(f"{k}={v_str}")
+    return ", ".join(parts)
 
 
 def _extract_codex_block(data: dict, max_len: int) -> str | None:
@@ -194,7 +266,7 @@ def _extract_codex_block(data: dict, max_len: int) -> str | None:
         return _fmt_tool_call(data, max_len)
     if dtype == "tool-call-result":
         return None
-    if dtype == "token_count":
+    if dtype in NOISE_BLOCK_TYPES:
         return None
     if dtype in ("reasoning", "agent_reasoning"):
         return None
@@ -393,6 +465,56 @@ def format_session_status(s: dict) -> str:
     return "\n".join(lines)
 
 
+def format_capabilities(caps: dict, sid: str) -> str:
+    """格式化会话能力配置"""
+    lines = [f"📋 会话能力配置 ({sid[:8]})"]
+
+    skills = caps.get("skills", [])
+    if skills:
+        lines.append(f"\n🧩 Skills ({len(skills)}):")
+        for sk in skills:
+            name = sk.get("name", "?") if isinstance(sk, dict) else str(sk)
+            desc = sk.get("description", "") if isinstance(sk, dict) else ""
+            if desc:
+                lines.append(f"  - {name}: {desc[:60]}")
+            else:
+                lines.append(f"  - {name}")
+    else:
+        lines.append("\n🧩 Skills: 无")
+
+    cmds = caps.get("slash_commands", [])
+    if cmds:
+        lines.append(f"\n⚡ Slash Commands ({len(cmds)}):")
+        for c in cmds:
+            name = c.get("name", "?") if isinstance(c, dict) else str(c)
+            desc = c.get("description", "") if isinstance(c, dict) else ""
+            source = c.get("source", "") if isinstance(c, dict) else ""
+            suffix = f" [{source}]" if source else ""
+            if desc:
+                lines.append(f"  - /{name}: {desc[:50]}{suffix}")
+            else:
+                lines.append(f"  - /{name}{suffix}")
+    else:
+        lines.append("\n⚡ Slash Commands: 无")
+
+    mcps = caps.get("mcp_servers", [])
+    if mcps:
+        lines.append(f"\n🔌 MCP Servers ({len(mcps)}):")
+        for name in mcps:
+            lines.append(f"  - {name}")
+    else:
+        lines.append("\n🔌 MCP Servers: 无")
+
+    claude_md = caps.get("claude_md_summary", "")
+    if claude_md:
+        lines.append(f"\n📝 CLAUDE.md 摘要:")
+        lines.append(f"  {claude_md[:200]}")
+    else:
+        lines.append("\n📝 CLAUDE.md: 未找到")
+
+    return "\n".join(lines)
+
+
 def format_messages(messages: list[dict], max_preview: int = 0) -> str:
     """格式化消息列表（无 seq 编号，仅 role: text 格式）"""
     if not messages:
@@ -537,11 +659,15 @@ def format_question_notification(req: dict, label: str, total: int, session_tota
     return "\n".join(lines)
 
 
-def format_permission_notification(label: str, detail: str, total: int, session_total: int, index: int) -> str:
+def format_permission_notification(label: str, detail: str, total: int, session_total: int, index: int, context: str = "") -> str:
     """格式化普通权限审批通知，复用统一的会话前缀。"""
     lines = [
         f"🔐 权限请求 {label}",
         f"  {detail}",
+    ]
+    if context:
+        lines.append(f"  💭 上下文: {context}")
+    lines += [
         "",
         f"当前总共 {total} 个待审批，当前会话共 {session_total} 个待审批，此请求审批序号 {index}",
         "",
@@ -563,13 +689,10 @@ def format_request_detail(req: dict) -> str:
     args = req.get("arguments", {})
     if not isinstance(args, dict) or not args:
         return tool
-    cmd = args.get("command", "")
-    if cmd:
-        return f"{tool}: {cmd[:150]}"
-    args_str = json.dumps(args, ensure_ascii=False)
-    if len(args_str) > 120:
-        args_str = args_str[:120] + "..."
-    return f"{tool}: {args_str}"
+    readable = format_tool_args_readable(tool, args, max_len=150)
+    if readable:
+        return f"{tool}: {readable}"
+    return tool
 
 
 def format_pending_requests(pending: dict[str, dict], sessions_cache: list[dict]) -> str:

@@ -180,6 +180,23 @@ class HapiConnectorPlugin(Star):
         async for result in self.llm_integration.tool_list_commands(event, topic):
             yield result
 
+    @filter.llm_tool(name="hapi_coding_list_machines")
+    async def tool_list_machines(self, event: AstrMessageEvent):
+        '''列出所有在线机器及其信息，以及最近使用过的工作目录。用于创建会话前了解可用环境。'''
+        async for result in self.llm_integration.tool_list_machines(event):
+            yield result
+
+    @filter.llm_tool(name="hapi_coding_browse_directory")
+    async def tool_browse_directory(self, event: AstrMessageEvent, path: str, machine_id: str = ""):
+        '''浏览机器上的目录内容，用于创建会话前探索文件结构。
+
+        Args:
+            path(string): 要浏览的目录路径（如 /root、/home/user）
+            machine_id(string): 机器 ID（可选，单机器时自动选择）
+        '''
+        async for result in self.llm_integration.tool_browse_directory(event, path, machine_id):
+            yield result
+
     @filter.llm_tool(name="hapi_coding_send_message")
     async def tool_send_message(self, event: AstrMessageEvent, message: str):
         '''向当前 session 发送消息。消息发送后立即返回，Claude Code 完成处理后系统会自动推送结果。
@@ -351,9 +368,29 @@ class HapiConnectorPlugin(Star):
 
     # ──── 生命周期 ────
 
+    def _install_skill(self):
+        """将 hapi-connector Agent Skill 安装到 AstrBot skills 目录"""
+        import shutil
+        from pathlib import Path
+        try:
+            from astrbot.core.utils.astrbot_path import get_astrbot_skills_path
+            skill_src = Path(__file__).parent / "skills" / "hapi-connector"
+            skill_dst = Path(get_astrbot_skills_path()) / "hapi-connector"
+            if skill_src.exists():
+                skill_dst.mkdir(parents=True, exist_ok=True)
+                for src_file in skill_src.iterdir():
+                    if src_file.is_file():
+                        shutil.copy2(str(src_file), str(skill_dst / src_file.name))
+                logger.info("Agent Skill 已安装: %s", skill_dst)
+        except Exception as e:
+            logger.warning("Agent Skill 安装失败: %s", e)
+
     async def initialize(self):
         """插件初始化：打开 client、加载用户状态、启动 SSE"""
         await self.client.init()
+
+        # F3: 安装 Agent Skill 文件
+        self._install_skill()
 
         # 从 KV 加载状态
         await self.state_mgr.load_all()

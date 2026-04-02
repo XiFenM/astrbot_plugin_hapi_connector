@@ -78,6 +78,7 @@ class CreateWizard:
             lines.append("回复序号选择，或直接输入新路径")
         else:
             lines.append("请输入完整路径")
+        lines.append("💡 输入 ls <路径> 浏览目录（如: ls /root）")
         return "\n".join(lines)
 
     def _step5_prompt(self) -> WizardResult:

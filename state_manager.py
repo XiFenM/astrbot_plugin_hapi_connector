@@ -16,6 +16,21 @@ class StateManager:
         self.binding_mgr = binding_mgr
         self._user_states_cache: dict[str, dict] = {}
         self._session_owners = binding_mgr._session_owners
+        self._session_capabilities: dict[str, dict] = {}  # F2: 会话能力缓存（内存，不持久化）
+
+    # ──── 会话能力缓存 ────
+
+    def set_capabilities(self, sid: str, caps: dict):
+        """缓存会话的能力配置"""
+        self._session_capabilities[sid] = caps
+
+    def get_capabilities(self, sid: str) -> dict | None:
+        """获取会话的能力配置（None 表示未缓存）"""
+        return self._session_capabilities.get(sid)
+
+    def clear_capabilities(self, sid: str):
+        """清除会话的能力缓存"""
+        self._session_capabilities.pop(sid, None)
 
     # ──── 持久化 ────
 

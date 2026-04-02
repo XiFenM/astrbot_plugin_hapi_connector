@@ -2,6 +2,7 @@
 
 import copy
 import json
+import time
 import asyncio
 import datetime
 from collections.abc import Callable, Awaitable
@@ -11,7 +12,7 @@ from astrbot.api import logger
 from .hapi_client import AsyncHapiClient, ContentTypeError
 from .formatters import (extract_text_preview, session_label_short, format_request_detail,
                          format_agent_line, is_question_request, format_question_notification,
-                         format_permission_notification)
+                         format_permission_notification, NOISE_BLOCK_TYPES)
 from . import session_ops
 
 
@@ -65,6 +66,9 @@ class SSEListener:
         self._auto_decision_mgr: "AutoDecisionManager | None" = None
         # {sid: {"pre_send_seq": int, "ts": float}}，tool_send_message 注册的完成回调上下文
         self._pending_llm_completions: dict[str, dict] = {}
+        # F7: SSE 断连通知状态
+        self._disconnect_notified: bool = False
+        self._disconnect_notify_task: asyncio.Task | None = None
 
     def start(self, output_level: str = "summary", remind_pending: bool = False, remind_interval: int = 180,
               auto_approve_enabled: bool = False, auto_approve_start: str = "23:00", auto_approve_end: str = "07:00",
@@ -80,6 +84,7 @@ class SSEListener:
         self._auto_approve_start = auto_approve_start
         self._auto_approve_end = auto_approve_end
         self._max_reconnect = max_reconnect_attempts
+        self._disconnect_notified = False
         self._debounce_sids: set[str] = set()
         self._debounce_task: asyncio.Task | None = None
         self._completion_sids: set[str] = set()
@@ -100,7 +105,8 @@ class SSEListener:
                      getattr(self, '_debounce_task', None),
                      getattr(self, '_completion_task', None),
                      getattr(self, '_compact_check_task', None),
-                     getattr(self, '_request_notify_task', None)):
+                     getattr(self, '_request_notify_task', None),
+                     getattr(self, '_disconnect_notify_task', None)):
             if task and not task.done():
                 task.cancel()
                 try:
@@ -135,6 +141,16 @@ class SSEListener:
                 result[sid][rid] = req_copy
         return result
 
+    async def _delayed_disconnect_notify(self):
+        """F7: 3 秒延迟后，若连接仍未恢复则通知用户"""
+        try:
+            await asyncio.sleep(3)
+            if self.conn_fail_count > 0 and not self._disconnect_notified:
+                self._disconnect_notified = True
+                await self._push_notification("⚠️ SSE 连接已断开，正在自动重连...", "")
+        except asyncio.CancelledError:
+            pass
+
     async def _listen_loop(self):
         """主循环：SSE 监听 + 指数退避重连"""
         backoff = 1
@@ -158,8 +174,12 @@ class SSEListener:
                         self._hibernated = False
                         if self.conn_fail_count > 0:
                             logger.info("SSE 连接已恢复（此前连续失败 %d 次）", self.conn_fail_count)
-                            if was_hibernated:
+                            # F7: 取消待发送的断连通知
+                            if self._disconnect_notify_task and not self._disconnect_notify_task.done():
+                                self._disconnect_notify_task.cancel()
+                            if self._disconnect_notified or was_hibernated:
                                 await self._push_notification("✅ SSE 连接已恢复", "")
+                            self._disconnect_notified = False
                         backoff = 1
                         self.conn_fail_count = 0
                     buf += chunk
@@ -183,11 +203,19 @@ class SSEListener:
                 hint = "（疑似 Cloudflare 验证页）" if "text/html" in e.content_type else ""
                 self.conn_error = f"{e} {hint}".strip()
                 logger.warning("SSE 连接异常: %s %s, %ds 后重连", e, hint, backoff)
+                # F7: 首次断连启动延迟通知
+                if self.conn_fail_count == 1 and not self._disconnect_notified:
+                    if self._disconnect_notify_task is None or self._disconnect_notify_task.done():
+                        self._disconnect_notify_task = asyncio.create_task(self._delayed_disconnect_notify())
             except Exception as e:
                 self.conn_fail_count += 1
                 err_desc = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
                 self.conn_error = err_desc
                 logger.warning("SSE 断线: %s, %ds 后重连", err_desc, backoff)
+                # F7: 首次断连启动延迟通知
+                if self.conn_fail_count == 1 and not self._disconnect_notified:
+                    if self._disconnect_notify_task is None or self._disconnect_notify_task.done():
+                        self._disconnect_notify_task = asyncio.create_task(self._delayed_disconnect_notify())
             finally:
                 if resp is not None:
                     resp.release()
@@ -233,11 +261,17 @@ class SSEListener:
             if old_seq == -1:
                 old_seq = await self._get_latest_seq(sid)
 
-            self.session_states[sid] = {
+            new_state = {
                 "active": is_active,
                 "thinking": is_thinking,
                 "lastSeq": old_seq,
             }
+            # F4: 记录 thinking 开始时间
+            if is_thinking and not old_thinking:
+                new_state["thinking_start"] = time.monotonic()
+            elif "thinking_start" in old_state:
+                new_state["thinking_start"] = old_state["thinking_start"]
+            self.session_states[sid] = new_state
 
         # 处理权限请求
         new_requests: list[tuple[str, dict]] = []
@@ -270,6 +304,7 @@ class SSEListener:
 
             # 有新的权限请求 -> 推送提醒（或忙时自动批准）
             queued_notifications: list[str] = []
+            _approval_ctx_cache: str | None = None  # F8: 同一批请求复用同一次 API 调用
             for rid, req in new_requests:
                 label = session_label_short(sid, self.sessions_cache)
                 async with self._lock:
@@ -314,7 +349,10 @@ class SSEListener:
                         msg = format_question_notification(req, label, total, session_total, index)
                     else:
                         detail = format_request_detail(req)
-                        msg = format_permission_notification(label, detail, total, session_total, index)
+                        # F8: 拉取最近 agent 消息作为上下文（同批请求共享一次调用）
+                        if _approval_ctx_cache is None:
+                            _approval_ctx_cache = await self._fetch_approval_context(sid)
+                        msg = format_permission_notification(label, detail, total, session_total, index, context=_approval_ctx_cache)
 
                     # suggest 模式：在通知前追加 LLM 分析
                     if suggestion_prefix:
@@ -505,6 +543,55 @@ class SSEListener:
         except Exception as e:
             logger.warning("发送 LLM 回复失败: %s", e)
 
+    @staticmethod
+    def _format_duration(secs: float) -> str:
+        """将秒数格式化为可读时长字符串"""
+        s = int(secs)
+        if s < 60:
+            return f"{s}秒"
+        mins, s = divmod(s, 60)
+        if mins < 60:
+            return f"{mins}分{s}秒" if s else f"{mins}分"
+        hours, m = divmod(mins, 60)
+        return f"{hours}时{m}分" if m else f"{hours}时"
+
+    async def _extract_completion_summary(self, sid: str, last_seq: int) -> str:
+        """提取最后 2 条 agent 文本消息合并为摘要（截断 200 字符）"""
+        try:
+            messages = await session_ops.fetch_messages(self.client, sid, limit=10)
+            texts = []
+            for msg in reversed(messages):
+                if len(texts) >= 2:
+                    break
+                if msg.get("seq", 0) > last_seq:
+                    continue
+                content = msg.get("content", {})
+                if content.get("role") not in ("agent", "assistant"):
+                    continue
+                text = extract_text_preview(content, max_len=0)
+                if text and not text.startswith("🛠️") and not text.startswith("["):
+                    texts.append(text)
+            if not texts:
+                return ""
+            combined = " / ".join(reversed(texts))
+            return combined[:200] if len(combined) > 200 else combined
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _infer_completion_status(text: str) -> str:
+        """根据文本关键词推断完成状态图标"""
+        if not text:
+            return "✅"
+        lower = text.lower()
+        error_kws = ("error", "failed", "fail", "错误", "失败", "报错", "exception")
+        if any(k in lower for k in error_kws):
+            return "⚠️"
+        done_kws = ("done", "complete", "完成", "成功", "已完成", "finish")
+        if any(k in lower for k in done_kws):
+            return "✅"
+        return "📋"
+
     async def _debounced_completion(self):
         """防抖：等待状态稳定后再推送任务完成通知（避免 Codex 频繁切换 thinking 导致重复推送）"""
         while True:
@@ -533,7 +620,21 @@ class SSEListener:
 
                     label = session_label_short(sid, self.sessions_cache)
                     self._completion_notified_seqs[sid] = last_seq
-                    await self._push_notification(f"✅ 会话已完成，等待新的输入\n{label}", sid)
+
+                    # F4: 耗时 + 摘要 + 状态推断
+                    thinking_start = state.get("thinking_start")
+                    duration_text = ""
+                    if thinking_start:
+                        duration_text = self._format_duration(time.monotonic() - thinking_start)
+                    summary_text = await self._extract_completion_summary(sid, last_seq)
+                    status_icon = self._infer_completion_status(summary_text)
+
+                    lines = [f"{status_icon} 会话已完成，等待新的输入", label]
+                    if duration_text:
+                        lines.append(f"  ⏱ 耗时: {duration_text}")
+                    if summary_text:
+                        lines.append(f"  📋 {summary_text}")
+                    await self._push_notification("\n".join(lines), sid)
             if not self._completion_sids:
                 break
 
@@ -655,6 +756,14 @@ class SSEListener:
             for msg in new_msgs:
                 content = msg.get("content", {})
                 text = extract_text_preview(content, max_len=0)
+                # 安全网：检测漏网的噪音 JSON（如 rate_limit_event）
+                if text is not None and text.startswith("{"):
+                    try:
+                        parsed = json.loads(text)
+                        if isinstance(parsed, dict) and parsed.get("type") in NOISE_BLOCK_TYPES:
+                            text = None
+                    except (json.JSONDecodeError, ValueError):
+                        pass
                 if text is not None:
                     visible_msgs.append((msg, text))
 
@@ -887,6 +996,21 @@ class SSEListener:
         """回收序号"""
         if index > 0:
             self._free_indices.add(index)
+
+    async def _fetch_approval_context(self, sid: str) -> str:
+        """F8: 拉取最后 5 条消息，取最近一条 agent 文本作为审批上下文（截断 80 字符）"""
+        try:
+            messages = await session_ops.fetch_messages(self.client, sid, limit=5)
+            for msg in reversed(messages):
+                content = msg.get("content", {})
+                if content.get("role") not in ("agent", "assistant"):
+                    continue
+                text = extract_text_preview(content, max_len=0)
+                if text and not text.startswith("🛠️") and not text.startswith("["):
+                    return text[:80]
+        except Exception:
+            pass
+        return ""
 
     async def _push_notification(self, text: str, session_id: str):
         """通过回调向所有已注册的管理员推送消息，审批通知自动附带序号列表用于 Telegram 内联键盘。"""

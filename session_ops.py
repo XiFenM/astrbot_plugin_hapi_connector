@@ -1,5 +1,11 @@
 """Session 操作函数：异步封装多步 API 调用"""
 
+import asyncio
+import base64
+import json
+import time
+
+from astrbot.api import logger
 from .hapi_client import AsyncHapiClient
 
 
@@ -277,3 +283,76 @@ async def read_file(client: AsyncHapiClient, sid: str,
     if not content:
         return False, "文件内容为空或不存在"
     return True, content
+
+
+async def fetch_skills(client: AsyncHapiClient, sid: str) -> list[dict]:
+    """获取会话可用的 skills 列表"""
+    data = await client.get_json(f"/api/sessions/{sid}/skills")
+    return data.get("skills", [])
+
+
+async def fetch_slash_commands(client: AsyncHapiClient, sid: str) -> list[dict]:
+    """获取会话可用的 slash commands 列表"""
+    data = await client.get_json(f"/api/sessions/{sid}/slash-commands")
+    return data.get("commands", data.get("slashCommands", []))
+
+
+async def fetch_session_capabilities(client: AsyncHapiClient, sid: str) -> dict:
+    """并行抓取会话的能力配置（skills/commands/CLAUDE.md/MCP），单个失败不影响整体"""
+    results = await asyncio.gather(
+        _safe_fetch(fetch_skills, client, sid),
+        _safe_fetch(fetch_slash_commands, client, sid),
+        _safe_fetch(read_file, client, sid, "CLAUDE.md"),
+        _safe_fetch(read_file, client, sid, ".claude/settings.json"),
+        return_exceptions=True,
+    )
+
+    caps: dict = {"skills": [], "slash_commands": [], "claude_md_summary": "",
+                  "mcp_servers": [], "fetched_at": time.monotonic()}
+
+    # skills
+    if isinstance(results[0], list):
+        caps["skills"] = results[0]
+
+    # slash commands
+    if isinstance(results[1], list):
+        caps["slash_commands"] = results[1]
+
+    # CLAUDE.md
+    if isinstance(results[2], tuple) and results[2][0]:
+        try:
+            text = base64.b64decode(results[2][1]).decode("utf-8", errors="replace")
+            caps["claude_md_summary"] = text[:500]
+        except Exception:
+            pass
+
+    # settings.json → MCP servers
+    if isinstance(results[3], tuple) and results[3][0]:
+        try:
+            settings = json.loads(base64.b64decode(results[3][1]).decode("utf-8", errors="replace"))
+            caps["mcp_servers"] = list(settings.get("mcpServers", {}).keys())
+        except Exception:
+            pass
+
+    return caps
+
+
+async def _safe_fetch(fn, *args):
+    """包装异步调用，异常时返回 None 而非抛出"""
+    try:
+        return await fn(*args)
+    except Exception as e:
+        logger.debug("capability fetch failed (%s): %s", fn.__name__, e)
+        return None
+
+
+async def check_path_exists(client: AsyncHapiClient, machine_id: str, path: str) -> bool:
+    """检查机器上的路径是否存在"""
+    try:
+        resp = await client.post(f"/api/machines/{machine_id}/paths/exists",
+                                 json={"path": path})
+        data = await resp.json()
+        resp.release()
+        return data.get("exists", False)
+    except Exception:
+        return False

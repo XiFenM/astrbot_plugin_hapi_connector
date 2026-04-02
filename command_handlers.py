@@ -74,6 +74,7 @@ class CommandHandlers:
             "upload": (self.cmd_upload, True),
             "bind": (self.cmd_bind, True),
             "routes": (self.cmd_routes, False),
+            "caps": (self.cmd_caps, True),
         }
         route = routes.get(subcommand)
         if route is None:
@@ -736,6 +737,35 @@ class CommandHandlers:
             if not raw:
                 controller.keep(timeout=120, reset_timeout=True)
                 return
+
+            # F12: 步骤 2 中支持 ls 浏览目录
+            if wiz.state["step"] == 2 and raw.lower().startswith("ls"):
+                browse_path = raw[2:].strip() or "/"
+                mid = wiz.state.get("machine_id")
+                # 借用该机器上已有 session 来浏览
+                borrowed_sid = None
+                for s in self.sessions_cache:
+                    if s.get("machineId") == mid:
+                        borrowed_sid = s.get("id")
+                        break
+                if borrowed_sid:
+                    try:
+                        entries = await session_ops.list_directory(self.client, borrowed_sid, path=browse_path)
+                        lines = [f"📂 {browse_path}:"]
+                        for e in entries[:20]:
+                            icon = "📁" if e.get("type") == "directory" else "📄"
+                            lines.append(f"  {icon} {e.get('name', '?')}")
+                        if len(entries) > 20:
+                            lines.append(f"  ... 还有 {len(entries) - 20} 项")
+                        lines.append("\n请输入路径或序号选择目录:")
+                        await ev.send(ev.plain_result("\n".join(lines)))
+                    except Exception as e:
+                        await ev.send(ev.plain_result(f"浏览失败: {e}\n请直接输入路径:"))
+                else:
+                    await ev.send(ev.plain_result("该机器无活跃会话，无法浏览目录。请直接输入路径:"))
+                controller.keep(timeout=120, reset_timeout=True)
+                return
+
             r = wiz.process(raw)
 
             # 需要拉 recent_paths 再显示步骤 2
@@ -1383,6 +1413,30 @@ class CommandHandlers:
             yield event.plain_result("暂无推送路由\n使用 /hapi bind 设置默认发送窗口")
         else:
             yield event.plain_result("\n".join(lines))
+
+    # ── caps ──
+
+    async def cmd_caps(self, event: AstrMessageEvent, target: str = ""):
+        """查看会话能力配置: /hapi caps [refresh]"""
+        await self.state_mgr.ensure_primary_session(event)
+        sid = self.state_mgr.effective_sid(event)
+        if not sid:
+            yield event.plain_result("当前窗口无可操作的 session")
+            return
+
+        force_refresh = target.strip().lower() == "refresh"
+        caps = self.state_mgr.get_capabilities(sid)
+
+        if force_refresh or caps is None:
+            yield event.plain_result("正在抓取会话能力配置...")
+            try:
+                caps = await session_ops.fetch_session_capabilities(self.client, sid)
+                self.state_mgr.set_capabilities(sid, caps)
+            except Exception as e:
+                yield event.plain_result(f"抓取失败: {e}")
+                return
+
+        yield event.plain_result(formatters.format_capabilities(caps, sid))
 
     # ── reset ──
 
