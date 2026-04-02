@@ -449,13 +449,23 @@ quick_prefix (快捷前缀): {quick_prefix}
 
         yield "\n".join(lines)
 
-    async def tool_browse_directory(self, event: AstrMessageEvent, path: str, machine_id: str = ""):
+    async def tool_browse_directory(self, event: AstrMessageEvent, path: str = "", machine_id: str = ""):
         '''浏览机器上的目录内容，用于创建会话前探索文件结构。
 
         Args:
-            path(string): 要浏览的目录路径（如 /root、/home/user）
+            path(string): 要浏览的目录路径（如 /root、/home/user）；留空则提示常用路径
             machine_id(string): 机器 ID（可选，单机器时自动选择）
         '''
+        if not path:
+            yield (
+                "请指定要浏览的目录路径，例如：\n"
+                "  /root\n"
+                "  /home/user\n"
+                "  /workspace\n"
+                "  /tmp"
+            )
+            return
+
         try:
             machines = await session_ops.fetch_machines(self.client)
         except Exception as e:
@@ -506,12 +516,12 @@ quick_prefix (快捷前缀): {quick_prefix}
             except Exception as e:
                 yield f"浏览目录失败: {e}"
         else:
-            # 无可借用的 session，尝试检测路径是否存在
-            exists = await session_ops.check_path_exists(self.client, target_mid, path)
-            if exists:
-                yield f"路径 {path} 存在，但该机器无活跃会话，无法列出目录内容。请先创建一个会话。"
-            else:
-                yield f"路径 {path} 不存在或无法访问"
+            # 无可借用的 session，无法浏览目录（list_directory 依赖已有 session）
+            yield (
+                f"该机器上暂无活跃会话，无法浏览目录。\n"
+                f"请先创建一个会话，或直接指定工作目录路径（Claude Code 会自动创建不存在的目录）。\n"
+                f"常用路径参考：/root、/home/user、/workspace、/tmp"
+            )
 
     # ──── 操作类工具（需要审批）────
 
