@@ -88,7 +88,9 @@ class HapiConnectorPlugin(Star):
         self.sse_listener = SSEListener(
             self.client,
             self.sessions_cache,
-            lambda text, sid: self.notification_mgr.push_notification(text, sid, self.sessions_cache)
+            lambda text, sid, indices=None: self.notification_mgr.push_notification(
+                text, sid, self.sessions_cache, approval_indices=indices),
+            plugin=self,
         )
 
         # 待审批管理器
@@ -180,7 +182,8 @@ class HapiConnectorPlugin(Star):
 
     @filter.llm_tool(name="hapi_coding_send_message")
     async def tool_send_message(self, event: AstrMessageEvent, message: str):
-        '''向当前 session 发送消息。
+        '''向当前 session 发送消息。消息发送后立即返回，Claude Code 完成处理后系统会自动推送结果。
+        请勿在调用后轮询 get_status 或 message_history，结果会自动送达。
 
         Args:
             message(string): 要发送的消息内容
@@ -276,10 +279,16 @@ class HapiConnectorPlugin(Star):
         message_str = (event.message_str or "").strip()
         raw_stripped = raw.strip() if raw else ""
 
+        # 如果 raw 带有 /hapi 前缀，直接使用（LLM 工具调用场景传入完整指令）
+        if raw_stripped:
+            lowered = raw_stripped.lower()
+            if lowered.startswith("/hapi") or lowered.startswith("hapi"):
+                return self._strip_hapi_prefix(raw_stripped)
+
         # 从 message_str 提取完整内容
         from_message = self._strip_hapi_prefix(message_str)
 
-        # 如果 raw 非空且看起来更完整（LLM 工具调用场景会传入完整指令），使用 raw
+        # 如果 raw 非空且看起来更完整，使用 raw
         if raw_stripped and len(raw_stripped.split()) >= len(from_message.split()):
             return self._strip_hapi_prefix(raw_stripped)
 
@@ -369,6 +378,19 @@ class HapiConnectorPlugin(Star):
         auto_approve_start = self.config.get("auto_approve_start", "23:00")
         auto_approve_end = self.config.get("auto_approve_end", "07:00")
         max_reconnect = self.config.get("max_reconnect_attempts", 30)
+
+        # Auto-decision (opt-in)
+        # 向后兼容：旧 bool 配置映射到 "auto"
+        auto_decision_mode = self.config.get("auto_decision_mode", "off")
+        if auto_decision_mode == "off" and self.config.get("auto_decision_enabled", False):
+            auto_decision_mode = "auto"
+
+        auto_decision_mgr = None
+        if auto_decision_mode in ("auto", "suggest"):
+            from .auto_decision import AutoDecisionManager
+            auto_decision_mgr = AutoDecisionManager(self, mode=auto_decision_mode)
+            logger.info("LLM 决策已启用，模式: %s", auto_decision_mode)
+
         self.sse_listener.start(
             output_level,
             remind_pending=remind,
@@ -378,6 +400,7 @@ class HapiConnectorPlugin(Star):
             auto_approve_end=auto_approve_end,
             summary_msg_count=self._summary_msg_count,
             max_reconnect_attempts=max_reconnect,
+            auto_decision_mgr=auto_decision_mgr,
         )
         logger.info("HAPI Connector 已初始化，SSE 输出级别: %s", output_level)
 
@@ -392,7 +415,7 @@ class HapiConnectorPlugin(Star):
     @filter.command("hapi")
     async def handle_hapi(self, event: AstrMessageEvent, raw: str = ""):
         """处理 /hapi 命令"""
-        logger.debug(f"[handle_hapi] raw='{raw}', message_str='{event.message_str}'")
+        logger.debug(f"[handle_hapi] raw='{raw}', message_str='{event.message_str}', platform='{event.get_platform_name()}'")
         if not self._is_admin(event):
             yield event.plain_result("⚠️ 此命令仅限管理员使用")
             return

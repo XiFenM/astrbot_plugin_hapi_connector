@@ -142,7 +142,52 @@ class CommandHandlers:
         if machine_hint:
             text += "\n\n" + machine_hint
 
-        yield event.plain_result(text)
+        # 附加内联切换按钮
+        platform = event.get_platform_name()
+        if platform == "telegram":
+            try:
+                from astrbot.core.platform.sources.telegram.tg_event import TelegramInlineKeyboard
+                from astrbot.api.event import MessageChain
+                buttons = []
+                for i, sess in enumerate(visible_sessions, 1):
+                    meta = sess.get("metadata", {})
+                    path = meta.get("path", "")
+                    dir_name = path.rstrip("/").split("/")[-1] if path else sess.get("id", "")[:8]
+                    flavor = meta.get("flavor", "")[:3]
+                    label = f"[{flavor}] {dir_name[:15]}"
+                    marker = "▶ " if sess.get("id") == current_sid else ""
+                    buttons.append([(f"{marker}{label} 切换", f"hapi_sw:{i}")])
+                chain = MessageChain().message(text)
+                chain.chain.append(TelegramInlineKeyboard(buttons=buttons))
+                from astrbot.core.message.message_event_result import MessageEventResult
+                yield MessageEventResult(chain=chain.chain)
+            except Exception:
+                yield event.plain_result(text)
+        elif platform == "discord":
+            try:
+                from astrbot.core.platform.sources.discord.components import DiscordButton, DiscordView
+                from astrbot.api.event import MessageChain
+                buttons = []
+                for i, sess in enumerate(visible_sessions, 1):
+                    meta = sess.get("metadata", {})
+                    path = meta.get("path", "")
+                    dir_name = path.rstrip("/").split("/")[-1] if path else sess.get("id", "")[:8]
+                    flavor = meta.get("flavor", "")[:3]
+                    label = f"[{flavor}] {dir_name[:15]}"
+                    marker = "▶ " if sess.get("id") == current_sid else ""
+                    buttons.append(DiscordButton(
+                        label=f"{marker}{label}",
+                        custom_id=f"hapi_sw:{i}",
+                        style="primary" if sess.get("id") != current_sid else "secondary",
+                    ))
+                chain = MessageChain().message(text)
+                chain.chain.append(DiscordView(components=buttons))
+                from astrbot.core.message.message_event_result import MessageEventResult
+                yield MessageEventResult(chain=chain.chain)
+            except Exception:
+                yield event.plain_result(text)
+        else:
+            yield event.plain_result(text)
 
     # ── sw ──
 

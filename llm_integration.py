@@ -1,7 +1,7 @@
 """LLM 工具集成 - 为 LLM 提供 HAPI Coding Session 交互能力"""
 
 import asyncio
-from astrbot.api.event import filter, AstrMessageEvent, MessageChain
+from astrbot.api.event import AstrMessageEvent, MessageChain
 from astrbot.api.provider import ProviderRequest
 from astrbot.api import logger
 from . import session_ops
@@ -20,23 +20,24 @@ class LLMIntegration:
 
     # ──── 工具可见性控制 ────
 
-    @filter.on_llm_request()
     async def on_llm_request_hook(self, event: AstrMessageEvent, request: ProviderRequest):
         """根据权限和窗口状态动态控制工具可见性"""
         # 1. 权限检查：非管理员移除所有工具
         is_admin = self.plugin._is_admin(event)
-        logger.debug(f"[LLM工具] 权限检查: is_admin={is_admin}")
+        sender_id = event.get_sender_id()
+        umo = event.unified_msg_origin
+        logger.info(f"[LLM工具] 权限检查: is_admin={is_admin}, sender_id={sender_id}, umo={umo}")
         if not is_admin:
             self._remove_hapi_tools(request, keep_basic=False)
-            logger.debug("[LLM工具] 非管理员，已移除所有工具")
+            logger.info("[LLM工具] 非管理员，已移除所有 hapi 工具")
             return
 
         # 2. 上下文检查：窗口无可见 session 时只保留基础工具
         visible_sessions = self.state_mgr.visible_sessions_for_window(event, self.sessions_cache)
-        logger.debug(f"[LLM工具] 可见session数: {len(visible_sessions)}, 总session数: {len(self.sessions_cache)}")
+        logger.info(f"[LLM工具] 可见session数: {len(visible_sessions)}, 总session数: {len(self.sessions_cache)}")
         if not visible_sessions:
             self._remove_hapi_tools(request, keep_basic=True)
-            logger.debug("[LLM工具] 当前窗口无可见session，已移除非基础工具")
+            logger.info("[LLM工具] 当前窗口无可见session，已保留基础工具")
             return
 
     def _remove_hapi_tools(self, request: ProviderRequest, keep_basic: bool = False):
@@ -48,11 +49,13 @@ class LLMIntegration:
         if not hasattr(request, 'func_tool') or not request.func_tool:
             return
 
-        # 基础工具（始终可用）
+        # 基础工具（始终可用，即使无可见 session）
         basic_tools = {
             "hapi_coding_list_sessions",
             "hapi_coding_list_commands",
             "hapi_coding_execute_command",
+            "hapi_coding_create_session",
+            "hapi_coding_send_message",
         }
 
         # 所有工具
@@ -117,7 +120,31 @@ class LLMIntegration:
 
         notification_sent = False
         try:
-            await event.send(MessageChain().message(msg))
+            chain = MessageChain().message(msg)
+            platform = event.get_platform_name()
+            if platform == "telegram":
+                try:
+                    from astrbot.core.platform.sources.telegram.tg_event import TelegramInlineKeyboard
+                    chain.chain.append(TelegramInlineKeyboard(buttons=[
+                        [(f"✅ 批准 #{index}", f"hapi_approve:{index}"),
+                         (f"❌ 拒绝 #{index}", f"hapi_deny:{index}")],
+                        [("✅ 全部批准", "hapi_approve:all"),
+                         ("❌ 全部拒绝", "hapi_deny:all")],
+                    ]))
+                except Exception as e:
+                    logger.warning("构建 LLM 工具审批 keyboard 失败: %s", e)
+            elif platform == "discord":
+                try:
+                    from astrbot.core.platform.sources.discord.components import DiscordButton, DiscordView
+                    chain.chain.append(DiscordView(components=[
+                        DiscordButton(label=f"✅ 批准 #{index}", custom_id=f"hapi_approve:{index}", style="success"),
+                        DiscordButton(label=f"❌ 拒绝 #{index}", custom_id=f"hapi_deny:{index}", style="danger"),
+                        DiscordButton(label="✅ 全部批准", custom_id="hapi_approve:all", style="success"),
+                        DiscordButton(label="❌ 全部拒绝", custom_id="hapi_deny:all", style="danger"),
+                    ]))
+                except Exception as e:
+                    logger.warning("构建 Discord 审批按钮失败: %s", e)
+            await event.send(chain)
             notification_sent = True
         except Exception as e:
             logger.warning(f"LLM 工具审批通知发送失败: {e}")
@@ -297,8 +324,45 @@ quick_prefix (快捷前缀): {quick_prefix}
 
     # ──── 操作类工具（需要审批）────
 
+    # ──── send_message 辅助方法 ────
+
+    async def _fetch_completion_response(self, sid: str, pre_send_seq: int) -> str:
+        """拉取 Claude Code 在 pre_send_seq 之后的回复，格式化为文本返回给 LLM。"""
+        max_response_len = 4000
+        try:
+            messages = await session_ops.fetch_messages(self.client, sid, limit=50)
+            new_msgs = [
+                m for m in messages
+                if m.get("seq", 0) > pre_send_seq
+                and m.get("content", {}).get("role") != "user"
+            ]
+
+            if not new_msgs:
+                return "消息已发送，Claude Code 已处理完成。"
+
+            texts = []
+            for msg in sorted(new_msgs, key=lambda m: m.get("seq", 0)):
+                text = formatters.extract_text_preview(msg.get("content", {}), max_len=0)
+                if text:
+                    texts.append(text)
+
+            if not texts:
+                return "消息已发送，Claude Code 已处理完成。"
+
+            response = "\n\n".join(texts)
+            if len(response) > max_response_len:
+                response = response[:max_response_len] + "\n...(内容过长已截断，可调用 hapi_coding_message_history 查看完整内容)"
+
+            return f"消息已发送，Claude Code 处理完成。回复:\n\n{response}"
+        except Exception as e:
+            logger.warning(f"[tool_send_message] 获取回复失败: {e}")
+            return f"消息已发送，Claude Code 已处理完成，但获取回复失败: {e}"
+
+    # ──── 操作类工具（需要审批）————续 ────
+
     async def tool_send_message(self, event: AstrMessageEvent, message: str):
-        '''向当前 session 发送消息。
+        '''向当前 session 发送消息。消息发送后立即返回，Claude Code 完成处理后系统会自动推送结果。
+        请勿在调用后轮询 get_status 或 message_history，结果会自动送达。
 
         Args:
             message(string): 要发送的消息内容
@@ -320,9 +384,44 @@ quick_prefix (快捷前缀): {quick_prefix}
                 yield "操作已被用户拒绝，请停止工具调用，先交流清楚问题"
             return
 
+        # 记录发送前的消息序号
+        sse = self.plugin.sse_listener
+        async with sse._lock:
+            pre_send_seq = sse.session_states.get(sid, {}).get("lastSeq", 0)
+
         # 执行发送
+        logger.info(f"[tool_send_message] sending to sid={sid[:8]}, msg_len={len(message)}")
         ok, result = await session_ops.send_message(self.client, sid, message)
-        yield result if ok else f"发送失败: {result}"
+        if not ok:
+            yield f"发送失败: {result}"
+            return
+
+        # 存储完成回调上下文，供 SSE listener 完成时调用 LLM 回复
+        import copy, time
+        sse._pending_llm_completions[sid] = {
+            "pre_send_seq": pre_send_seq,
+            "ts": time.monotonic(),
+        }
+        # 启动超时监控
+        asyncio.create_task(self._send_timeout_watch(sid))
+        logger.info(f"[tool_send_message] sent, registered completion callback sid={sid[:8]}")
+
+        yield ("消息已发送给 Claude Code，正在后台处理中。\n"
+               "[重要] 请勿调用 hapi_coding_get_status 或 hapi_coding_message_history 轮询进度。"
+               "Claude Code 完成后系统会自动将结果推送给用户。\n"
+               "请直接回复用户：任务已提交给 Claude Code，完成后会自动通知结果。")
+
+    async def _send_timeout_watch(self, sid: str, timeout: int = 300):
+        """超时监控：如果 Claude Code 在 timeout 秒内未完成，推送超时通知并清理。"""
+        await asyncio.sleep(timeout)
+        sse = self.plugin.sse_listener
+        ctx = sse._pending_llm_completions.pop(sid, None)
+        if not ctx:
+            return  # 已正常完成，无需处理
+        logger.info(f"[tool_send_message] timeout for sid={sid[:8]}")
+        await sse._push_notification(
+            f"⏱️ Claude Code 任务超时（{timeout}秒内未完成）。\n"
+            "可使用 /hapi msg 查看当前状态。", sid)
 
     async def tool_switch_session(self, event: AstrMessageEvent, target: str):
         '''切换到指定的 session。
@@ -427,11 +526,14 @@ quick_prefix (快捷前缀): {quick_prefix}
             return
 
         # 执行创建
+        logger.info(f"[StreamDebug] tool_create_session: spawning session dir={directory} agent={agent}")
         ok, msg, sid = await session_ops.spawn_session(self.client, machine_id, directory, agent, session_type, yolo, model_reasoning_effort=normalized_effort or None)
         if ok and sid:
             await self.state_mgr.capture_window(sid, event.unified_msg_origin, agent)
+            logger.info(f"[StreamDebug] tool_create_session: success, yielding result sid={sid[:8]}")
             yield f"✅ 已创建 session: {sid[:8]}"
         else:
+            logger.info(f"[StreamDebug] tool_create_session: failed, yielding error: {msg}")
             yield f"创建失败: {msg}"
 
     async def tool_change_config(self, event: AstrMessageEvent, config_name: str, value: str):
@@ -524,12 +626,13 @@ quick_prefix (快捷前缀): {quick_prefix}
             return
 
         # 执行命令
-        logger.info(f"[LLM工具] 开始执行命令: {command}")
+        logger.info(f"[StreamDebug] tool_execute_command: 开始执行命令: {command}")
         results = []
         async for result in self.plugin.cmd_handlers.cmd_hapi_router(event, f"/hapi {command}"):
-            logger.info(f"[LLM工具] 收到结果，类型: {type(result)}")
+            logger.info(f"[StreamDebug] tool_execute_command: 收到结果，类型: {type(result)}")
 
-            # 立即发送给用户
+            # 立即发送给用户（注意：这里会直接 event.send，工具 yield 也会返回给框架）
+            logger.info(f"[StreamDebug] tool_execute_command: event.send(result) - 直接发送给用户")
             await event.send(result)
 
             # 提取文本
@@ -540,19 +643,22 @@ quick_prefix (快捷前缀): {quick_prefix}
                         text_parts.append(seg.text)
                 if text_parts:
                     text = "".join(text_parts)
-                    logger.info(f"[LLM工具] 提取文本: {text[:100]}...")
+                    logger.info(f"[StreamDebug] tool_execute_command: 提取文本: {text[:100]}...")
                     results.append(text)
 
-        logger.info(f"[LLM工具] 命令执行完成，共 {len(results)} 条消息")
+        logger.info(f"[StreamDebug] tool_execute_command: 命令执行完成，共 {len(results)} 条消息")
 
         # 检测交互式命令
         cmd_name = command.strip().split()[0] if command.strip() else ""
         interactive_cmds = ['create', 'delete', 'rename', 'archive', 'perm', 'model', 'output', 'prune']
 
         if cmd_name in interactive_cmds:
+            logger.info(f"[StreamDebug] tool_execute_command: 交互式命令，yield 提示文本")
             yield f"这是一条交互式命令，用户已自行完成交互设置，你可以自行思考和查看操作结果"
         elif results:
+            logger.info(f"[StreamDebug] tool_execute_command: yield {len(results)} 条结果回框架（可能导致重复显示）")
             yield "\n\n".join(results)
         else:
+            logger.info(f"[StreamDebug] tool_execute_command: yield '命令执行完成'")
             yield "命令执行完成"
 

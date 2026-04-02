@@ -19,10 +19,12 @@ class SSEListener:
     """后台 SSE 监听，实时捕获权限请求、等待输入、任务完成等事件"""
 
     def __init__(self, client: AsyncHapiClient, sessions_cache: list[dict],
-                 notify_callback: Callable[[str, str], Awaitable[None]]):
+                 notify_callback: Callable[[str, str, "list[int] | None"], Awaitable[None]],
+                 plugin=None):
         self.client = client
         self.sessions_cache = sessions_cache
         self.notify_callback = notify_callback
+        self._plugin = plugin
         self.output_level: str = "detail"
         # {session_id: {request_id: {tool, arguments, ...}}}
         self.pending: dict[str, dict] = {}
@@ -60,13 +62,18 @@ class SSEListener:
         self._queued_request_notifications: dict[str, list[str]] = {}
         self._request_notify_sids: set[str] = set()
         self._request_notify_task: asyncio.Task | None = None
+        self._auto_decision_mgr: "AutoDecisionManager | None" = None
+        # {sid: {"pre_send_seq": int, "ts": float}}，tool_send_message 注册的完成回调上下文
+        self._pending_llm_completions: dict[str, dict] = {}
 
     def start(self, output_level: str = "summary", remind_pending: bool = False, remind_interval: int = 180,
               auto_approve_enabled: bool = False, auto_approve_start: str = "23:00", auto_approve_end: str = "07:00",
-              summary_msg_count: int = 5, max_reconnect_attempts: int = 0):
+              summary_msg_count: int = 5, max_reconnect_attempts: int = 0,
+              auto_decision_mgr=None):
         """启动 SSE 监听任务"""
         self.output_level = output_level
         self._summary_msg_count = summary_msg_count
+        self._auto_decision_mgr = auto_decision_mgr
         self._remind_enabled = remind_pending
         self._remind_interval = remind_interval
         self._auto_approve_enabled = auto_approve_enabled
@@ -279,11 +286,40 @@ class SSEListener:
                     notify_msg = f"[忙时托管审批] 已自动批准\n{label}\n  {result_mark} {tool}"
                     queued_notifications.append(notify_msg)
                 else:
+                    suggestion_prefix = None
+
+                    # LLM 决策：处理问题和审批请求
+                    if self._auto_decision_mgr is not None:
+                        if is_question_request(req):
+                            result = await self._auto_decision_mgr.try_auto_decide(sid, rid, req)
+                        else:
+                            result = await self._auto_decision_mgr.try_auto_decide_approval(sid, rid, req)
+
+                        if result.handled:
+                            # auto 模式已处理，从 pending 移除
+                            async with self._lock:
+                                if sid in self.pending and rid in self.pending[sid]:
+                                    idx = self.pending[sid][rid].get("index", 0)
+                                    if idx > 0:
+                                        self.free_index(idx)
+                                    del self.pending[sid][rid]
+                                    if not self.pending[sid]:
+                                        del self.pending[sid]
+                            continue
+
+                        suggestion_prefix = result.suggestion_text
+
+                    # 正常通知流程（决策未启用/失败/上报/suggest 模式走这里）
                     if is_question_request(req):
                         msg = format_question_notification(req, label, total, session_total, index)
                     else:
                         detail = format_request_detail(req)
                         msg = format_permission_notification(label, detail, total, session_total, index)
+
+                    # suggest 模式：在通知前追加 LLM 分析
+                    if suggestion_prefix:
+                        msg = suggestion_prefix + msg
+
                     queued_notifications.append(msg)
 
             self._queue_request_notifications(sid, queued_notifications)
@@ -400,6 +436,75 @@ class SSEListener:
             if not self._request_notify_sids:
                 break
 
+    async def _llm_reply_completion(self, sid: str):
+        """Claude Code 完成后，带上下文调用 LLM 生成回复，发给用户，并回写对话历史。"""
+        ctx = self._pending_llm_completions.pop(sid, None)
+        if not ctx:
+            return
+
+        # 1. 拉取 Claude Code 回复
+        response = await self._plugin.llm_integration._fetch_completion_response(
+            sid, ctx["pre_send_seq"]
+        )
+
+        # 2. 确定 umo 和 provider
+        targets = self._plugin.state_mgr.select_notification_targets(sid, self.sessions_cache)
+        umo = targets[0] if targets else None
+        if not umo:
+            return
+
+        user_prompt = (
+            "[Claude Code 任务完成通知]\n"
+            "你之前通过 hapi_coding_send_message 提交的任务已完成。"
+            f"以下是 Claude Code 的处理结果：\n\n{response}\n\n"
+            "请根据以上结果向用户做出简要回复。"
+        )
+
+        reply_text = response  # fallback
+        try:
+            context = self._plugin.context
+            prov_id = await context.get_current_chat_provider_id(umo=umo)
+            if not prov_id:
+                logger.warning("[LLM回复] 未找到可用 provider，直接推送原始结果")
+                await self._push_notification(response, sid)
+                return
+
+            # 3. 读取当前对话上下文
+            conv_mgr = context.conversation_manager
+            conv_id = await conv_mgr.get_curr_conversation_id(umo)
+            history_contexts = None
+            if conv_id:
+                conversation = await conv_mgr.get_conversation(umo, conv_id)
+                if conversation and conversation.history:
+                    import json
+                    history_contexts = json.loads(conversation.history)
+
+            # 4. 带上下文调用 LLM
+            llm_resp = await context.llm_generate(
+                chat_provider_id=prov_id,
+                prompt=user_prompt,
+                contexts=history_contexts,
+            )
+            reply_text = llm_resp.completion_text.strip() or response
+
+            # 5. 回写对话历史
+            if conv_id:
+                await conv_mgr.add_message_pair(
+                    cid=conv_id,
+                    user_message={"role": "user", "content": user_prompt},
+                    assistant_message={"role": "assistant", "content": reply_text},
+                )
+        except Exception as e:
+            logger.warning("LLM 回复生成失败，回退原始结果: %s", e)
+
+        # 6. 发送给用户
+        from astrbot.api.event import MessageChain
+        chain = MessageChain().message(reply_text)
+        try:
+            await self._plugin.context.send_message(umo, chain)
+        except Exception as e:
+            logger.warning("发送 LLM 回复失败: %s", e)
+
     async def _debounced_completion(self):
         """防抖：等待状态稳定后再推送任务完成通知（避免 Codex 频繁切换 thinking 导致重复推送）"""
         while True:
@@ -423,6 +528,9 @@ class SSEListener:
                         last_seq = self.session_states.get(sid, {}).get("lastSeq", last_seq)
                     if last_seq <= self._completion_notified_seqs.get(sid, -1):
                         continue
+                    # 如果有 tool_send_message 注册的回调，调用 LLM 生成回复
+                    await self._llm_reply_completion(sid)
+
                     label = session_label_short(sid, self.sessions_cache)
                     self._completion_notified_seqs[sid] = last_seq
                     await self._push_notification(f"✅ 会话已完成，等待新的输入\n{label}", sid)
@@ -642,8 +750,31 @@ class SSEListener:
             logger.warning("simple 模式获取消息异常: %s", e)
             return False
 
+    async def _llm_summarize(self, raw_texts: list[str], sid: str) -> str | None:
+        """调用 LLM 将任务进度原始文本总结为简洁汇报。失败返回 None（由调用方 fallback 到原始展示）。"""
+        if not self._plugin or not raw_texts:
+            return None
+        try:
+            targets = self._plugin.state_mgr.select_notification_targets(sid, self.sessions_cache)
+            umo = targets[0] if targets else None
+            prov = self._plugin.context.get_using_provider(umo=umo)
+            if not prov:
+                return None
+            combined = "\n---\n".join(raw_texts)
+            resp = await prov.text_chat(
+                system_prompt=(
+                    "你是任务进度总结助手。用1-3句简洁的话总结 AI 编程助手的工作进展，"
+                    "使用中文，突出关键动作和结果，不要重复内容，不要加多余修饰语。"
+                ),
+                prompt=f"请总结以下 AI 编程会话的最新进展:\n\n{combined}",
+            )
+            return resp.completion_text.strip() or None
+        except Exception as e:
+            logger.warning("LLM 总结失败，回退原始展示: %s", e)
+            return None
+
     async def _show_summary(self, sid: str, old_seq: int) -> bool:
-        """summary 模式：获取并显示最近 N 条新 agent 消息（过滤工具调用）"""
+        """summary 模式：获取最近 N 条新 agent 消息，调用 LLM 总结后推送；LLM 失败时降级展示原始文本。"""
         try:
             messages = await session_ops.fetch_messages(self.client, sid, limit=50)
             if not messages:
@@ -678,7 +809,12 @@ class SSEListener:
 
             label = session_label_short(sid, self.sessions_cache)
 
-            if len(agent_texts) == 1:
+            # 尝试 LLM 总结
+            raw_texts = [t for _, t in agent_texts]
+            summary = await self._llm_summarize(raw_texts, sid)
+            if summary:
+                output = f"{label}\n📝 {summary}"
+            elif len(agent_texts) == 1:
                 _, text = agent_texts[0]
                 output = f"{label}\n{format_agent_line(text)}"
             else:
@@ -753,8 +889,14 @@ class SSEListener:
             self._free_indices.add(index)
 
     async def _push_notification(self, text: str, session_id: str):
-        """通过回调向所有已注册的管理员推送消息"""
-        await self.notify_callback(text, session_id)
+        """通过回调向所有已注册的管理员推送消息，审批通知自动附带序号列表用于 Telegram 内联键盘。"""
+        indices = None
+        if session_id and ("待审批" in text or "上下文过长" in text or "提醒" in text):
+            reqs = self.pending.get(session_id, {})
+            raw = [req.get("index") for req in reqs.values()
+                   if req.get("index") and req.get("type") != "llm_tool"]
+            indices = sorted(set(i for i in raw if i)) or None
+        await self.notify_callback(text, session_id, indices)
 
     async def load_existing_pending(self):
         """启动时从已有 session 加载待审批请求"""

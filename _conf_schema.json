@@ -96,6 +96,25 @@
     "default": "07:00",
     "hint": "例如开始 22:00、结束 08:00，即晚上10点到次日早上8点，支持跨午夜"
   },
+  "auto_decision_mode": {
+    "description": "LLM 决策模式",
+    "type": "string",
+    "default": "off",
+    "options": ["auto", "suggest", "off"],
+    "hint": "auto: 全自动（LLM 代替用户审批和回答，高风险操作仍上报）；suggest: 辅助（LLM 分析建议，用户手动操作）；off: 关闭"
+  },
+  "auto_decision_max_history": {
+    "description": "LLM 自动决策时拉取的最大历史消息数",
+    "type": "int",
+    "default": 30,
+    "hint": "更多消息 = 更好的上下文 + 更多 token 消耗"
+  },
+  "auto_decision_confidence_threshold": {
+    "description": "LLM 自动决策置信度阈值（1-10），低于此值将上报用户",
+    "type": "int",
+    "default": 7,
+    "hint": "值越高越保守，推荐 6-8"
+  },
   "default_notification_window": {
     "description": "默认通知发送窗口",
     "type": "string",
