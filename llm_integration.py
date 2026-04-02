@@ -24,20 +24,14 @@ class LLMIntegration:
         """根据权限和窗口状态动态控制工具可见性"""
         # 1. 权限检查：非管理员移除所有工具
         is_admin = self.plugin._is_admin(event)
-        sender_id = event.get_sender_id()
-        umo = event.unified_msg_origin
-        logger.info(f"[LLM工具] 权限检查: is_admin={is_admin}, sender_id={sender_id}, umo={umo}")
         if not is_admin:
             self._remove_hapi_tools(request, keep_basic=False)
-            logger.info("[LLM工具] 非管理员，已移除所有 hapi 工具")
             return
 
         # 2. 上下文检查：窗口无可见 session 时只保留基础工具
         visible_sessions = self.state_mgr.visible_sessions_for_window(event, self.sessions_cache)
-        logger.info(f"[LLM工具] 可见session数: {len(visible_sessions)}, 总session数: {len(self.sessions_cache)}")
         if not visible_sessions:
             self._remove_hapi_tools(request, keep_basic=True)
-            logger.info("[LLM工具] 当前窗口无可见session，已保留基础工具")
             return
 
     def _remove_hapi_tools(self, request: ProviderRequest, keep_basic: bool = False):
@@ -85,8 +79,27 @@ class LLMIntegration:
         """请求审批并等待结果
 
         Returns:
-            (approved, reason): approved=True表示批准，reason说明原因（"approved"/"denied"/"timeout"/"notification_failed"）
+            (approved, reason): approved=True表示批准，reason说明原因（"approved"/"denied"/"timeout"/"notification_failed"/"auto_decided"）
         """
+        # ── Auto Decision 检查 ──
+        auto_decision_mgr = getattr(self.plugin.sse_listener, '_auto_decision_mgr', None)
+        suggestion_prefix = None
+        if auto_decision_mgr is not None:
+            try:
+                result = await auto_decision_mgr.try_auto_decide_llm_tool(tool_name, args, event)
+                if result.handled:
+                    # auto 模式已决策
+                    approved = result.action == "approve"
+                    action_text = "✅ 已自动批准" if approved else "❌ 已自动拒绝"
+                    await event.send(MessageChain().message(
+                        f"🤖 [LLM 自动决策] AstrBot 工具: {tool_name}\n  {action_text}"
+                    ))
+                    return approved, "auto_decided"
+                # suggest 模式的建议文本
+                suggestion_prefix = result.suggestion_text
+            except Exception as e:
+                logger.warning("LLM 工具 Auto Decision 异常: %s", e)
+
         # LLM 工具审批使用窗口 ID 作为 key，而不是 session ID
         window_id = event.unified_msg_origin
 
@@ -117,6 +130,10 @@ class LLMIntegration:
   /hapi deny     全部拒绝
   /hapi deny <序号> 拒绝单个
   /hapi pending   查看完整列表"""
+
+        # suggest 模式：在通知前附加建议
+        if suggestion_prefix:
+            msg = suggestion_prefix + msg
 
         notification_sent = False
         try:
@@ -526,14 +543,14 @@ quick_prefix (快捷前缀): {quick_prefix}
             return
 
         # 执行创建
-        logger.info(f"[StreamDebug] tool_create_session: spawning session dir={directory} agent={agent}")
+        logger.info(f"[tool_create_session] spawning session dir={directory} agent={agent}")
         ok, msg, sid = await session_ops.spawn_session(self.client, machine_id, directory, agent, session_type, yolo, model_reasoning_effort=normalized_effort or None)
         if ok and sid:
             await self.state_mgr.capture_window(sid, event.unified_msg_origin, agent)
-            logger.info(f"[StreamDebug] tool_create_session: success, yielding result sid={sid[:8]}")
+            logger.debug(f"[tool_create_session] success sid={sid[:8]}")
             yield f"✅ 已创建 session: {sid[:8]}"
         else:
-            logger.info(f"[StreamDebug] tool_create_session: failed, yielding error: {msg}")
+            logger.debug(f"[tool_create_session] failed: {msg}")
             yield f"创建失败: {msg}"
 
     async def tool_change_config(self, event: AstrMessageEvent, config_name: str, value: str):
@@ -626,13 +643,8 @@ quick_prefix (快捷前缀): {quick_prefix}
             return
 
         # 执行命令
-        logger.info(f"[StreamDebug] tool_execute_command: 开始执行命令: {command}")
         results = []
         async for result in self.plugin.cmd_handlers.cmd_hapi_router(event, f"/hapi {command}"):
-            logger.info(f"[StreamDebug] tool_execute_command: 收到结果，类型: {type(result)}")
-
-            # 立即发送给用户（注意：这里会直接 event.send，工具 yield 也会返回给框架）
-            logger.info(f"[StreamDebug] tool_execute_command: event.send(result) - 直接发送给用户")
             await event.send(result)
 
             # 提取文本
@@ -642,23 +654,16 @@ quick_prefix (快捷前缀): {quick_prefix}
                     if hasattr(seg, 'text'):
                         text_parts.append(seg.text)
                 if text_parts:
-                    text = "".join(text_parts)
-                    logger.info(f"[StreamDebug] tool_execute_command: 提取文本: {text[:100]}...")
-                    results.append(text)
-
-        logger.info(f"[StreamDebug] tool_execute_command: 命令执行完成，共 {len(results)} 条消息")
+                    results.append("".join(text_parts))
 
         # 检测交互式命令
         cmd_name = command.strip().split()[0] if command.strip() else ""
         interactive_cmds = ['create', 'delete', 'rename', 'archive', 'perm', 'model', 'output', 'prune']
 
         if cmd_name in interactive_cmds:
-            logger.info(f"[StreamDebug] tool_execute_command: 交互式命令，yield 提示文本")
-            yield f"这是一条交互式命令，用户已自行完成交互设置，你可以自行思考和查看操作结果"
+            yield "这是一条交互式命令，用户已自行完成交互设置，你可以自行思考和查看操作结果"
         elif results:
-            logger.info(f"[StreamDebug] tool_execute_command: yield {len(results)} 条结果回框架（可能导致重复显示）")
             yield "\n\n".join(results)
         else:
-            logger.info(f"[StreamDebug] tool_execute_command: yield '命令执行完成'")
             yield "命令执行完成"
 

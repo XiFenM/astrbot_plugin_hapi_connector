@@ -21,6 +21,7 @@ class DecisionResult:
 
     handled: bool  # True = 已完全处理，跳过正常通知
     suggestion_text: str | None = None  # suggest 模式：追加到通知前
+    action: str | None = None  # auto 模式决策结果: "approve" | "deny"
 
 
 # ──── 高风险检测 ────
@@ -37,6 +38,16 @@ HIGH_RISK_PATTERNS = frozenset({
 HIGH_RISK_TOOLS = frozenset({
     "DeleteFile", "RemoveDirectory",
 })
+
+# AstrBot LLM 工具描述（供 auto decision 理解工具用途）
+_LLM_TOOL_DESCRIPTIONS: dict[str, str] = {
+    "hapi_coding_create_session": "创建新的 AI 编程会话（指定工作目录和代理类型），是启动编程任务的常规操作",
+    "hapi_coding_send_message": "向 AI 编程会话发送消息/指令，用于与 AI 编程助手交互",
+    "hapi_coding_switch_session": "切换到另一个已有的 AI 编程会话",
+    "hapi_coding_change_config": "修改插件配置项（如输出级别、自动审批等）",
+    "hapi_coding_stop_message": "停止 AI 编程会话的当前消息生成",
+    "hapi_coding_execute_command": "执行 HAPI 管理指令（如查看状态、切换会话等）",
+}
 
 
 def _is_high_risk(req: dict) -> bool:
@@ -91,8 +102,8 @@ class AutoDecisionManager:
             threshold = self._plugin.config.get("auto_decision_confidence_threshold", 7)
             if answers is None or confidence < threshold:
                 logger.info(
-                    "[AutoDecision] 置信度不足: confidence=%s, threshold=%d (sid=%s)",
-                    confidence, threshold, sid[:8],
+                    "[AutoDecision] 置信度不足: confidence=%s, threshold=%d, reasoning=%s (sid=%s)",
+                    confidence, threshold, reasoning, sid[:8],
                 )
                 if self.mode == "suggest" and reasoning:
                     suggestion = self._format_suggestion(
@@ -175,8 +186,8 @@ class AutoDecisionManager:
             threshold = self._plugin.config.get("auto_decision_confidence_threshold", 7)
             if confidence < threshold or action == "escalate":
                 logger.info(
-                    "[AutoDecision] 审批上报: action=%s, confidence=%s, threshold=%d (sid=%s)",
-                    action, confidence, threshold, sid[:8],
+                    "[AutoDecision] 审批上报: action=%s, confidence=%s, threshold=%d, reasoning=%s (sid=%s)",
+                    action, confidence, threshold, reasoning, sid[:8],
                 )
                 if self.mode == "suggest":
                     suggestion = self._format_suggestion(
@@ -218,6 +229,129 @@ class AutoDecisionManager:
         except Exception as e:
             logger.warning("[AutoDecision] 审批决策异常: %s (sid=%s)", e, sid[:8])
             return DecisionResult(handled=False)
+
+    async def try_auto_decide_llm_tool(
+        self, tool_name: str, args: dict, event
+    ) -> DecisionResult:
+        """处理 AstrBot LLM 工具审批请求。
+
+        与 hapi SSE 审批不同，这里直接使用 event.unified_msg_origin 作为上下文来源，
+        不涉及 hapi session。
+
+        Returns:
+            DecisionResult — handled=True 时 action 字段为 "approve"/"deny"
+        """
+        try:
+            req = {"tool": tool_name, "arguments": args}
+            umo = event.unified_msg_origin
+
+            # 1. 高风险检测
+            if _is_high_risk(req):
+                logger.info("[AutoDecision] LLM工具高风险操作: %s", tool_name)
+                if self.mode == "suggest":
+                    warning = (
+                        f"🤖 [LLM 分析]\n"
+                        f"  ⚠️ 检测到高风险操作: {tool_name}\n"
+                        f"  💡 建议: 强烈建议人工审核\n"
+                    )
+                    return DecisionResult(handled=False, suggestion_text=warning)
+                return DecisionResult(handled=False)
+
+            # 2. 构建 prompt
+            # 从 event 中提取当前用户消息（因为审批发生在管线中，conversation history 可能还没更新）
+            current_user_msg = ""
+            try:
+                current_user_msg = event.message_str or ""
+            except Exception:
+                pass
+
+            tool_desc = _LLM_TOOL_DESCRIPTIONS.get(tool_name, "")
+            args_str = json.dumps(args, ensure_ascii=False, indent=2) if isinstance(args, dict) else str(args)
+            desc_line = f"工具说明: {tool_desc}\n" if tool_desc else ""
+
+            parts = []
+            if current_user_msg:
+                parts.append(f"=== 用户当前的消息 ===\n{current_user_msg}")
+            parts.append(
+                "=== 当前需要审批的工具请求 ===\n"
+                f"工具名称: {tool_name}\n"
+                f"{desc_line}"
+                f"参数:\n{args_str}\n\n"
+                "这是用户的 AI 助手在执行用户任务时请求使用的内部管理工具。\n"
+                "请根据用户当前的消息和对话上下文判断是否应该批准。"
+            )
+            approval_prompt = "\n\n".join(parts)
+
+            # 加入决策历史
+            decision_history = self._get_decision_history(umo)
+            if decision_history:
+                history_text = self._format_decision_history(decision_history)
+                approval_prompt = f"=== 之前的决策记录 ===\n{history_text}\n\n{approval_prompt}"
+
+            system_prompt = self._build_system_prompt_llm_tool()
+
+            # 3. 调用 LLM
+            response_text = await self._call_llm(system_prompt, approval_prompt, umo=umo)
+            if not response_text:
+                logger.warning("[AutoDecision] LLM工具审批: LLM 返回空响应")
+                return DecisionResult(handled=False)
+
+            # 4. 解析
+            action, reasoning, confidence = self._parse_approval_response(response_text)
+
+            # 5. 置信度检查
+            threshold = self._plugin.config.get("auto_decision_confidence_threshold", 7)
+            if confidence < threshold or action == "escalate":
+                logger.info(
+                    "[AutoDecision] LLM工具审批上报: action=%s, confidence=%s, threshold=%d, reasoning=%s",
+                    action, confidence, threshold, reasoning,
+                )
+                if self.mode == "suggest":
+                    suggestion = self._format_suggestion_llm_tool(
+                        tool_name, args, action, reasoning, confidence,
+                    )
+                    return DecisionResult(handled=False, suggestion_text=suggestion)
+                return DecisionResult(handled=False)
+
+            # ── suggest 模式：只给建议 ──
+            if self.mode == "suggest":
+                suggestion = self._format_suggestion_llm_tool(
+                    tool_name, args, action, reasoning, confidence,
+                )
+                return DecisionResult(handled=False, suggestion_text=suggestion)
+
+            # ── auto 模式：返回决策结果 ──
+            self._record_decision(umo, f"LLM工具: {tool_name}", action, reasoning)
+            logger.info(
+                "[AutoDecision] LLM工具自动%s: %s (confidence=%d)",
+                "批准" if action == "approve" else "拒绝", tool_name, confidence,
+            )
+            return DecisionResult(handled=True, action=action)
+
+        except Exception as e:
+            logger.warning("[AutoDecision] LLM工具审批异常: %s", e)
+            return DecisionResult(handled=False)
+
+    def _format_suggestion_llm_tool(
+        self, tool_name: str, args: dict, action: str,
+        reasoning: str, confidence: int,
+    ) -> str:
+        """格式化 LLM 工具审批的 suggest 模式建议文本。"""
+        action_labels = {
+            "approve": "建议批准 ✅",
+            "deny": "建议拒绝 ❌",
+            "escalate": "建议人工处理 ⚠️",
+        }
+        lines = [
+            "🤖 [LLM 分析]",
+            f"  📋 AstrBot 工具: {tool_name}",
+            f"  💡 建议: {action_labels.get(action, action)}",
+            f"  📊 置信度: {confidence}/10",
+        ]
+        if reasoning:
+            lines.append(f"  💬 理由: {reasoning}")
+        lines.append("")  # 空行分隔
+        return "\n".join(lines)
 
     # ════════════════════════════════════════
     # 上下文构建
@@ -271,13 +405,20 @@ class AutoDecisionManager:
     # LLM 调用
     # ════════════════════════════════════════
 
-    async def _call_llm(self, system_prompt: str, prompt: str, sid: str) -> str | None:
-        """通过官方 API 调用 LLM，带用户对话上下文。"""
+    async def _call_llm(self, system_prompt: str, prompt: str,
+                        sid: str = "", umo: str = "") -> str | None:
+        """通过官方 API 调用 LLM，带用户对话上下文。
+
+        Args:
+            sid: hapi session ID（用于查找 UMO）
+            umo: 直接指定 UMO（优先于 sid 查找）
+        """
         try:
-            targets = self._plugin.state_mgr.select_notification_targets(
-                sid, self._plugin.sessions_cache
-            )
-            umo = targets[0] if targets else None
+            if not umo:
+                targets = self._plugin.state_mgr.select_notification_targets(
+                    sid, self._plugin.sessions_cache
+                )
+                umo = targets[0] if targets else None
             if not umo:
                 logger.warning("[AutoDecision] 无可用通知目标")
                 return None
@@ -293,12 +434,21 @@ class AutoDecisionManager:
             try:
                 conv_mgr = context.conversation_manager
                 conv_id = await conv_mgr.get_curr_conversation_id(umo)
+                logger.debug("[AutoDecision] umo=%s, conv_id=%s", umo, conv_id)
                 if conv_id:
                     conversation = await conv_mgr.get_conversation(umo, conv_id)
                     if conversation and conversation.history:
                         history_contexts = json.loads(conversation.history)
+                        logger.debug("[AutoDecision] 获取到 %d 条对话上下文", len(history_contexts) if isinstance(history_contexts, list) else 0)
+                    else:
+                        logger.debug("[AutoDecision] 会话存在但无历史记录: conversation=%s", bool(conversation))
+                else:
+                    logger.debug("[AutoDecision] 未找到当前会话 ID")
             except Exception as e:
                 logger.debug("[AutoDecision] 读取对话上下文失败（非致命）: %s", e)
+
+            logger.debug("[AutoDecision] 调用 LLM: provider=%s, contexts=%s条, prompt_len=%d",
+                         provider_id, len(history_contexts) if isinstance(history_contexts, list) else 0, len(prompt))
 
             llm_resp = await context.llm_generate(
                 chat_provider_id=provider_id,
@@ -344,6 +494,25 @@ class AutoDecisionManager:
             "4. 涉及删除文件、rm -rf、生产环境部署、git push --force、"
             "修改系统配置等高风险操作 → 必须 ESCALATE\n"
             "5. 不确定操作是否安全或与任务无关 → 必须 ESCALATE\n\n"
+            "严格按以下 JSON 格式回复，不要包含其他内容：\n"
+            "```json\n"
+            '{"action": "approve"|"deny"|"escalate", "confidence": 1-10, '
+            '"reasoning": "简短的决策理由"}\n'
+            "```\n\n"
+            "confidence 表示确信程度：1=完全不确定，10=非常确定。"
+        )
+
+    def _build_system_prompt_llm_tool(self) -> str:
+        return (
+            "你是 AI 助手的工具使用审计助手。用户正在通过 AI 助手管理远程编程会话（HAPI Coding Session）。\n"
+            "AI 助手请求使用内部管理工具来执行用户的任务，你需要判断是否应该批准。\n\n"
+            "这些工具都是内部管理工具，用于：创建/切换编程会话、发送消息、修改配置等。\n"
+            "它们本身不会直接操作文件系统或执行危险命令。\n\n"
+            "规则：\n"
+            "1. 如果用户在对话中明确要求了相关操作（如创建会话、发送消息等） → 批准\n"
+            "2. 如果工具调用与用户的对话意图一致 → 批准\n"
+            "3. 修改配置类操作 → 根据上下文判断合理性\n"
+            "4. 与用户意图不相关或无法判断 → ESCALATE\n\n"
             "严格按以下 JSON 格式回复，不要包含其他内容：\n"
             "```json\n"
             '{"action": "approve"|"deny"|"escalate", "confidence": 1-10, '
