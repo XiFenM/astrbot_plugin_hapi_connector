@@ -9,16 +9,16 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.message_components import Poke
 import astrbot.api.message_components as Comp
 
-from .hapi_client import AsyncHapiClient
-from .cf_access import CfAccessManager
-from .sse_listener import SSEListener
-from .binding_manager import BindingManager
-from .state_manager import StateManager
-from .notification_manager import NotificationManager
-from .pending_manager import PendingManager
-from .command_handlers import CommandHandlers
-from . import session_ops
-from . import formatters
+from .core.hapi_client import AsyncHapiClient
+from .core.cf_access import CfAccessManager
+from .sse.sse_listener import SSEListener
+from .managers.binding_manager import BindingManager
+from .managers.state_manager import StateManager
+from .managers.notification_manager import NotificationManager
+from .managers.pending_manager import PendingManager
+from .ui.command_handlers import CommandHandlers
+from .ops import session_ops
+from .ui import formatters
 
 
 # ── AstrBot v4.18.3 pydantic v1 的 __setattr__ 会拦截 File 的 property setter，
@@ -112,7 +112,7 @@ class HapiConnectorPlugin(Star):
         self.notification_mgr._event_cache = {}
 
         # LLM 工具集成
-        from .llm_integration import LLMIntegration
+        from .llm.llm_integration import LLMIntegration
         self.llm_integration = LLMIntegration(self)
 
     def _is_admin(self, event: AstrMessageEvent) -> bool:
@@ -430,7 +430,7 @@ class HapiConnectorPlugin(Star):
 
         auto_decision_mgr = None
         if auto_decision_mode in ("auto", "suggest"):
-            from .auto_decision import AutoDecisionManager
+            from .llm.auto_decision import AutoDecisionManager
             auto_decision_mgr = AutoDecisionManager(self, mode=auto_decision_mode)
             logger.info("LLM 决策已启用，模式: %s", auto_decision_mode)
 
@@ -537,7 +537,7 @@ class HapiConnectorPlugin(Star):
     @filter.event_message_type(filter.EventMessageType.ALL, priority=10)
     async def quick_prefix_handler(self, event: AstrMessageEvent):
         """快捷前缀: > 消息 或 >N 消息 (仅管理员)"""
-        from . import file_ops
+        from .ops import file_ops
         self.notification_mgr._event_cache[event.unified_msg_origin] = event
         prefix = self._quick_prefix
         raw = event.message_str

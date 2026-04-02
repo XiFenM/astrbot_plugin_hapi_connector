@@ -11,7 +11,7 @@ from urllib.parse import unquote, urlparse
 import aiohttp
 
 from . import session_ops
-from .hapi_client import AsyncHapiClient
+from ..core.hapi_client import AsyncHapiClient
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 ATTACHMENT_COMPONENT_TYPES = {"file", "image"}

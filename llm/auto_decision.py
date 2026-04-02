@@ -11,8 +11,8 @@ from dataclasses import dataclass
 
 from astrbot.api import logger
 
-from . import approval_ops, session_ops
-from .formatters import extract_text_preview, is_question_request, session_label_short, format_tool_args_readable
+from ..ops import approval_ops, session_ops
+from ..ui.formatters import extract_text_preview, is_question_request, session_label_short, format_tool_args_readable
 
 
 @dataclass

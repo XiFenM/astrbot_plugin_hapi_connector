@@ -1,6 +1,6 @@
 """创建 Session 向导状态机：步骤推进、输入校验、提示文本构建"""
 
-from .constants import AGENTS, CODEX_REASONING_EFFORT_OPTIONS, CODEX_REASONING_EFFORT_VALUES
+from ..core.constants import AGENTS, CODEX_REASONING_EFFORT_OPTIONS, CODEX_REASONING_EFFORT_VALUES
 
 
 class WizardResult:

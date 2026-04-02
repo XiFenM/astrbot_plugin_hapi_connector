@@ -9,11 +9,11 @@ from collections.abc import Callable, Awaitable
 
 from astrbot.api import logger
 
-from .hapi_client import AsyncHapiClient, ContentTypeError
-from .formatters import (extract_text_preview, session_label_short, format_request_detail,
+from ..core.hapi_client import AsyncHapiClient, ContentTypeError
+from ..ui.formatters import (extract_text_preview, session_label_short, format_request_detail,
                          format_agent_line, is_question_request, format_question_notification,
                          format_permission_notification, NOISE_BLOCK_TYPES)
-from . import session_ops
+from ..ops import session_ops
 
 
 class SSEListener:

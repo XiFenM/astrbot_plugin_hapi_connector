@@ -4,7 +4,7 @@
 from astrbot.api.event import AstrMessageEvent
 from astrbot.core.utils.session_waiter import session_waiter, SessionController
 from . import formatters
-from . import session_ops
+from ..ops import session_ops
 from .formatters import is_compact_request
 
 

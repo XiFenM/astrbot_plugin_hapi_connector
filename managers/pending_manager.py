@@ -3,8 +3,8 @@
 import asyncio
 import time
 from astrbot.api.event import AstrMessageEvent
-from . import approval_ops
-from . import formatters
+from ..ops import approval_ops
+from ..ui import formatters
 
 
 class PendingManager:

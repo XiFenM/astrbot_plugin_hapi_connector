@@ -6,7 +6,7 @@ import json
 import time
 
 from astrbot.api import logger
-from .hapi_client import AsyncHapiClient
+from ..core.hapi_client import AsyncHapiClient
 
 
 async def fetch_sessions(client: AsyncHapiClient) -> list[dict]:

@@ -1,9 +1,9 @@
 """审批业务逻辑：扁平化待审批、批量审批、问题提示构建"""
 
-from .hapi_client import AsyncHapiClient
+from ..core.hapi_client import AsyncHapiClient
 from . import session_ops
-from . import formatters
-from .formatters import is_compact_request
+from ..ui import formatters
+from ..ui.formatters import is_compact_request
 
 
 def flatten_pending(pending_dict: dict) -> list[tuple[str, str, dict]]:
