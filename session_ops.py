@@ -346,6 +346,132 @@ async def _safe_fetch(fn, *args):
         return None
 
 
+async def find_cc_history_dir(client: AsyncHapiClient, sid: str,
+                              work_dir: str) -> str | None:
+    """根据 session 工作目录推算 Claude Code 历史目录路径。
+
+    Claude Code 路径规则: ~/.claude/projects/{path_with_dashes}/
+    例如 /root/workspace/host → /root/.claude/projects/-root-workspace-host/
+    """
+    # 方案 A：直接按路径规则推算
+    hash_name = work_dir.replace("/", "-")
+    if not hash_name.startswith("-"):
+        hash_name = "-" + hash_name
+    candidate = f"/root/.claude/projects/{hash_name}"
+    try:
+        entries = await list_directory(client, sid, candidate)
+        if entries:
+            return candidate
+    except Exception:
+        pass
+
+    # 方案 B：遍历 ~/.claude/projects/ 找匹配目录
+    try:
+        projects = await list_directory(client, sid, "/root/.claude/projects")
+        last_part = work_dir.rstrip("/").split("/")[-1]
+        for entry in projects:
+            if entry.get("type") != "directory":
+                continue
+            name = entry.get("name", "")
+            if last_part and last_part in name:
+                return f"/root/.claude/projects/{name}"
+    except Exception:
+        pass
+
+    return None
+
+
+async def read_cc_conversations(client: AsyncHapiClient, sid: str,
+                                history_dir: str) -> list[dict]:
+    """读取 Claude Code 历史目录下所有 JSONL 对话文件，全量提取关键片段。
+
+    Returns:
+        [{filename, turns: [{role, text/tool, ...}]}]  按修改时间从新到旧排序
+    """
+    entries = await list_directory(client, sid, history_dir)
+    jsonl_files = sorted(
+        [e for e in entries if e.get("name", "").endswith(".jsonl")],
+        key=lambda e: e.get("modified", ""),
+        reverse=True,
+    )
+
+    conversations = []
+    for f in jsonl_files:
+        path = f"{history_dir}/{f['name']}"
+        ok, b64_content = await read_file(client, sid, path)
+        if not ok:
+            continue
+        try:
+            text = base64.b64decode(b64_content).decode("utf-8", errors="replace")
+        except Exception:
+            continue
+
+        turns = _extract_key_turns(text)
+        if turns:
+            conversations.append({"filename": f["name"], "turns": turns})
+
+    return conversations
+
+
+def _extract_key_turns(jsonl_text: str) -> list[dict]:
+    """从 JSONL 提取关键对话片段（user 指令 / tool_use 名称 / assistant 回复）。
+
+    兼容两种 JSONL 格式：
+    - 直接格式：{role: "human"/"assistant", content: ...}
+    - Claude Code 嵌套格式：{type: "user"/"assistant", message: {role, content}}
+    """
+    turns: list[dict] = []
+    for line in jsonl_text.strip().split("\n"):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+        # 兼容嵌套格式：从 message 字段提取 role/content
+        role = record.get("role", "")
+        content = record.get("content", "")
+        if not role and "message" in record:
+            msg = record["message"]
+            if isinstance(msg, dict):
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+        # 也接受顶层 type 作为 role 的补充
+        if not role:
+            top_type = record.get("type", "")
+            if top_type in ("user", "human"):
+                role = "user"
+            elif top_type == "assistant":
+                role = "assistant"
+
+        if role in ("human", "user"):
+            if isinstance(content, list):
+                text_parts = [b.get("text", "") for b in content
+                              if isinstance(b, dict) and b.get("type") == "text"]
+                content = " ".join(text_parts)
+            if isinstance(content, str) and content.strip():
+                turns.append({"role": "user", "text": content})
+
+        elif role == "assistant":
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "tool_use":
+                        turns.append({
+                            "role": "tool_use",
+                            "tool": block.get("name", "?"),
+                            "input_preview": str(block.get("input", {})),
+                        })
+                    elif block.get("type") == "text" and block.get("text", "").strip():
+                        turns.append({"role": "assistant", "text": block["text"]})
+            elif isinstance(content, str) and content.strip():
+                turns.append({"role": "assistant", "text": content})
+
+    return turns
+
+
 async def check_path_exists(client: AsyncHapiClient, machine_id: str, path: str) -> bool:
     """检查机器上的路径是否存在"""
     try:

@@ -126,6 +126,18 @@
     "type": "int",
     "default": 60,
     "hint": "超时前 15 秒自动提醒用户，超时后直接通知用户并取消操作"
+  },
+  "playbook_segment_size": {
+    "description": "Playbook 分段总结的每段字符数上限",
+    "type": "int",
+    "default": 100000,
+    "hint": "历史对话内容超过此长度时按行分段逐步总结，值越大段数越少、LLM 调用次数越少"
+  },
+  "playbook_parallel": {
+    "description": "Playbook 分段总结是否并行执行",
+    "type": "bool",
+    "default": false,
+    "hint": "false=串行（每段携带上段摘要，质量更高但较慢）；true=并行（各段独立总结，速度快但各段间无上下文关联）"
   }
 }
 

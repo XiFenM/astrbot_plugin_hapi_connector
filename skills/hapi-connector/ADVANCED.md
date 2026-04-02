@@ -31,6 +31,24 @@
 - `hapi_coding_get_config_status`: 查看当前插件配置
 - `hapi_coding_change_config`: 修改配置（如输出级别、自动审批等）
 
+## 历史学习与 Playbook
+
+### 工作原理
+`hapi_coding_learn_history` 会读取远程机器上 Claude Code 的历史对话记录
+（~/.claude/projects/ 目录下的 JSONL 文件），提取关键交互片段，
+通过 LLM 分析生成 playbook（最佳实践总结）。
+
+### Playbook 生命周期
+- **生成**: LLM 工具调用或 `/hapi learn` 命令触发
+- **缓存**: 内存缓存 + KV 持久化，插件重启后自动恢复
+- **注入**: 通过 `on_llm_request_hook` 自动注入系统提示
+- **更新**: 重新调用 `hapi_coding_learn_history` 会覆盖旧 playbook
+
+### 使用建议
+- 项目初期或首次使用时运行一次
+- 大量新对话积累后可重新分析
+- Playbook 长度控制在 500 字以内，不会显著增加 token 消耗
+
 ## 输出级别
 
 - **silence**: 仅推送权限请求和任务完成

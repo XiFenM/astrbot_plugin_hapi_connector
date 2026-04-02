@@ -75,6 +75,7 @@ class CommandHandlers:
             "bind": (self.cmd_bind, True),
             "routes": (self.cmd_routes, False),
             "caps": (self.cmd_caps, True),
+            "learn": (self.cmd_learn, True),
         }
         route = routes.get(subcommand)
         if route is None:
@@ -1437,6 +1438,16 @@ class CommandHandlers:
                 return
 
         yield event.plain_result(formatters.format_capabilities(caps, sid))
+
+    # ── learn (F13) ──
+
+    async def cmd_learn(self, event: AstrMessageEvent, args: str = ""):
+        """分析历史对话生成 playbook: /hapi learn [session]"""
+        async for result in self.plugin.llm_integration.tool_learn_from_history(event, args):
+            if isinstance(result, str):
+                yield event.plain_result(result)
+            else:
+                yield result
 
     # ── reset ──
 

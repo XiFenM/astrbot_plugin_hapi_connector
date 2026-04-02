@@ -12,7 +12,8 @@ description: 通过 hapi_coding 工具调用远程 AI 编程助手（Claude Code
 0. （可选）用 `hapi_coding_list_machines` 查看在线机器和历史工作目录
 1. 用 `hapi_coding_list_sessions` 查看是否有可复用的会话
 2. 有相同目录的 idle 会话 → `hapi_coding_send_message`；没有 → `hapi_coding_create_session`
-3. 发送任务后告知用户"已提交，有进展会自动通知"，**不要轮询结果**
+3. **（推荐）首次使用某个 session 时，用 `hapi_coding_learn_history` 学习该项目的历史工作模式**
+4. 发送任务后告知用户"已提交，有进展会自动通知"，**不要轮询结果**
 
 ## 会话选择
 
@@ -32,6 +33,14 @@ description: 通过 hapi_coding 工具调用远程 AI 编程助手（Claude Code
 如果用户不确定在哪个目录创建会话：
 1. `hapi_coding_list_machines` — 查看在线机器和最近使用的目录
 2. `hapi_coding_list_session_paths` — 列出已有 session 的工作目录路径
+
+## 历史学习
+
+当需要向一个 session 发送编程任务时，如果系统提示中没有该 session 的历史经验（[HAPI 历史经验]），
+**主动调用 `hapi_coding_learn_history`** 来学习用户的工作习惯。这样可以：
+- 构造更符合用户习惯的指令
+- 遵循项目特定的约定（测试、提交、代码风格）
+- 避免用户已知的低效模式
 
 ## 关键规则
 

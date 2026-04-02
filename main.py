@@ -192,6 +192,17 @@ class HapiConnectorPlugin(Star):
         async for result in self.llm_integration.tool_list_session_paths(event):
             yield result
 
+    @filter.llm_tool(name="hapi_coding_learn_history")
+    async def tool_learn_history(self, event: AstrMessageEvent, session_target: str = ""):
+        '''分析指定 session 的 Claude Code 历史对话，学习有效的工作模式，生成 playbook 供后续指令构造参考。
+        首次向某个 session 发送编程任务前，建议先调用此工具学习该项目的历史经验。
+
+        Args:
+            session_target(string): 目标 session 序号或 ID 前缀（可选，默认当前 session）
+        '''
+        async for result in self.llm_integration.tool_learn_from_history(event, session_target):
+            yield result
+
     @filter.llm_tool(name="hapi_coding_send_message")
     async def tool_send_message(self, event: AstrMessageEvent, message: str):
         '''向当前 session 发送消息。消息发送后立即返回，Claude Code 完成处理后系统会自动推送结果。

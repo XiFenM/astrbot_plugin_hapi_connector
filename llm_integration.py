@@ -64,25 +64,46 @@ class LLMIntegration:
             state = "thinking" if is_thinking else ("active" if is_active else "idle")
             lines.append(f"  [{i}] {title[:30]} | {flavor} | {state} | {sid[:8]}")
 
-            # 附加能力摘要
+            # 附加能力详情
             caps = self.state_mgr.get_capabilities(sid)
             if caps:
-                cap_parts = []
                 if caps.get("mcp_servers"):
-                    cap_parts.append(f"MCP: {', '.join(caps['mcp_servers'][:5])}")
+                    lines.append(f"      MCP 服务: {', '.join(caps['mcp_servers'])}")
                 if caps.get("skills"):
-                    names = [sk.get("name", "?") for sk in caps["skills"][:5]]
-                    cap_parts.append(f"Skills: {', '.join(names)}")
+                    lines.append("      技能:")
+                    for sk in caps["skills"]:
+                        name = sk.get("name", "?")
+                        desc = sk.get("description", "")
+                        lines.append(f"        - {name}: {desc[:60]}" if desc else f"        - {name}")
                 if caps.get("slash_commands"):
-                    names = [c.get("name", "?") for c in caps["slash_commands"][:5]]
-                    cap_parts.append(f"Commands: {', '.join(names)}")
+                    lines.append(f"      可用命令 ({len(caps['slash_commands'])} 个):")
+                    for c in caps["slash_commands"]:
+                        name = c.get("name", "?")
+                        desc = c.get("description", "")
+                        source = c.get("source", "")
+                        suffix = f" [{source}]" if source else ""
+                        lines.append(f"        /{name}{suffix}: {desc[:50]}" if desc else f"        /{name}{suffix}")
                 if caps.get("claude_md_summary"):
-                    cap_parts.append(f"项目: {caps['claude_md_summary'][:100]}")
-                if cap_parts:
-                    lines.append(f"      能力: {' | '.join(cap_parts)}")
+                    lines.append(f"      项目描述: {caps['claude_md_summary'][:200]}")
 
+        # F13: 附加 playbook（历史学习经验，按 machine:path 去重）
+        seen_playbook_keys: set[str] = set()
+        for s in visible_sessions[:5]:
+            work_dir = s.get("metadata", {}).get("path", "")
+            machine_id = s.get("machineId", "")
+            pb_key = self._playbook_key(machine_id, work_dir)
+            if not pb_key or pb_key in seen_playbook_keys:
+                continue
+            playbook = self.state_mgr.get_playbook(pb_key)
+            if playbook:
+                seen_playbook_keys.add(pb_key)
+                proj_name = work_dir.rstrip("/").split("/")[-1] if work_dir else pb_key[:20]
+                lines.append(f"\n[HAPI 历史经验 - {proj_name}]")
+                lines.append(playbook)
+
+        injected_text = "\n".join(lines)
         if hasattr(request, 'system_prompt'):
-            request.system_prompt = (request.system_prompt or "") + "\n".join(lines)
+            request.system_prompt = (request.system_prompt or "") + injected_text
 
     def _remove_hapi_tools(self, request: ProviderRequest, keep_basic: bool = False):
         """移除所有 hapi_coding 工具
@@ -119,6 +140,7 @@ class LLMIntegration:
             "hapi_coding_execute_command",
             "hapi_coding_list_machines",       # F12
             "hapi_coding_list_session_paths",    # F12
+            "hapi_coding_learn_history",          # F13
         }
 
         # 决定要移除的工具
@@ -436,7 +458,7 @@ quick_prefix (快捷前缀): {quick_prefix}
             meta = m.get("metadata", {})
             host = meta.get("host", "unknown")
             plat = meta.get("platform", "?")
-            lines.append(f"  - {mid[:12]}: {host} ({plat})")
+            lines.append(f"  - {mid}: {host} ({plat})")
 
         try:
             recent = await session_ops.fetch_recent_paths(self.client)
@@ -473,6 +495,308 @@ quick_prefix (快捷前缀): {quick_prefix}
             return
 
         yield "\n".join(lines)
+
+    # ──── F13: 历史学习 ────
+
+    @staticmethod
+    def _playbook_key(machine_id: str, work_dir: str) -> str:
+        """构造 playbook 的唯一 key：machine_id:work_dir"""
+        mid = (machine_id or "").strip()
+        wd = (work_dir or "").strip()
+        if not wd:
+            return ""
+        return f"{mid}:{wd}" if mid else wd
+
+    async def tool_learn_from_history(self, event: AstrMessageEvent, session_target: str = ""):
+        '''分析指定 session 的 Claude Code 历史对话，学习有效的工作模式并生成 playbook。'''
+        # 解析目标 session
+        sid = None
+        if session_target.strip():
+            # 尝试序号或 ID 前缀
+            target = session_target.strip()
+            if target.isdigit():
+                visible = self.state_mgr.visible_sessions_for_window(event, self.sessions_cache)
+                idx = int(target) - 1
+                if 0 <= idx < len(visible):
+                    sid = visible[idx].get("id")
+            if not sid:
+                for s in self.sessions_cache:
+                    if s.get("id", "").startswith(target):
+                        sid = s["id"]
+                        break
+        if not sid:
+            sid = self._effective_sid(event)
+        if not sid:
+            yield "未找到目标 session，请先切换到一个 session 或指定 session ID"
+            return
+
+        # 获取 session 工作目录
+        session = next((s for s in self.sessions_cache if s.get("id") == sid), None)
+        if not session:
+            yield "session 信息不可用"
+            return
+        work_dir = session.get("metadata", {}).get("path", "")
+        if not work_dir:
+            yield "该 session 没有工作目录信息"
+            return
+
+        yield f"📚 正在查找 {work_dir} 的 Claude Code 历史记录..."
+
+        # 获取可用于文件操作的 sid（原 session 可能不活跃）
+        machine_id = session.get("machineId", "")
+        file_sid = sid  # 默认用原 session
+        temp_sid: str | None = None  # 临时 session，用完归档
+
+        # 先用原 session 探测文件系统是否可访问
+        try:
+            probe = await session_ops.list_directory(self.client, file_sid, "/root")
+        except Exception:
+            probe = []
+
+        if not probe and machine_id:
+            # 原 session 不可用，在目标机器的 / 创建临时 session
+            logger.info("[playbook] 原 session 文件系统不可访问，创建临时 session...")
+            yield "🔄 正在创建临时会话以访问文件系统..."
+            ok, msg, new_sid = await session_ops.spawn_session(
+                self.client, machine_id, "/", "claude",
+            )
+            if ok and new_sid:
+                file_sid = new_sid
+                temp_sid = new_sid
+                logger.info("[playbook] 临时 session 已创建: %s", new_sid[:8])
+            else:
+                logger.warning("[playbook] 临时 session 创建失败: %s", msg)
+                yield f"⚠️ 无法创建临时会话访问文件系统: {msg}"
+                return
+
+        try:
+            # 定位历史目录
+            history_dir = await session_ops.find_cc_history_dir(self.client, file_sid, work_dir)
+            if not history_dir:
+                yield "未找到该工作目录的 Claude Code 历史记录（路径: ~/.claude/projects/）"
+                return
+
+            # 读取对话
+            conversations = await session_ops.read_cc_conversations(
+                self.client, file_sid, history_dir,
+            )
+            if not conversations:
+                yield "历史目录下没有找到对话记录"
+                return
+        finally:
+            # 清理临时 session
+            if temp_sid:
+                logger.info("[playbook] 归档临时 session %s", temp_sid[:8])
+                try:
+                    await session_ops.archive_session(self.client, temp_sid)
+                except Exception as e:
+                    logger.warning("[playbook] 临时 session 归档失败: %s", e)
+
+        # 格式化对话内容
+        formatted_convs = self._format_conversations(conversations)
+        combined = "\n\n".join(formatted_convs)
+        total_len = len(combined)
+
+        yield f"📖 找到 {len(conversations)} 个历史对话，内容总长度 {total_len:,} 字符"
+
+        # 长度超过阈值时分段总结（从插件配置读取，默认 100000）
+        segment_threshold = self.plugin.config.get("playbook_segment_size", 100000)
+        if total_len > segment_threshold:
+            segment_count = (total_len + segment_threshold - 1) // segment_threshold
+            yield f"⚠️ 内容较长（{total_len:,} 字符），将分 {segment_count} 段逐步总结，每段携带前段摘要以保持连贯性。"
+
+        # 调用 LLM 分析（自动处理分段）
+        playbook = await self._analyze_history_with_llm(
+            formatted_convs, work_dir, event, segment_threshold,
+        )
+        if not playbook:
+            yield "LLM 分析失败，请稍后重试"
+            return
+
+        # 存储 playbook（按 machine_id:work_dir，独立于 session 生命周期）
+        machine_id = session.get("machineId", "")
+        pb_key = self._playbook_key(machine_id, work_dir)
+        self.state_mgr.set_playbook(pb_key, playbook)
+        await self.state_mgr.persist_playbook(pb_key)
+        await self.state_mgr.persist_playbook_index()
+        logger.info("[playbook] 已生成 key=%s len=%d", pb_key, len(playbook))
+
+        yield f"✅ Playbook 已生成并保存！\n\n{playbook}"
+
+    @staticmethod
+    def _format_conversations(conversations: list[dict]) -> list[str]:
+        """将对话列表格式化为 LLM 可读的文本段落列表（每个对话一个段落）"""
+        formatted = []
+        for conv in conversations:
+            lines = [f"=== 对话: {conv['filename']} ==="]
+            for turn in conv["turns"]:
+                if turn["role"] == "user":
+                    lines.append(f"[用户指令] {turn['text']}")
+                elif turn["role"] == "tool_use":
+                    lines.append(f"[工具调用] {turn['tool']}: {turn.get('input_preview', '')}")
+                elif turn["role"] == "assistant":
+                    lines.append(f"[助手回复] {turn['text']}")
+            formatted.append("\n".join(lines))
+        return formatted
+
+    _PLAYBOOK_SYSTEM_PROMPT = (
+        "你是编程助手使用模式分析专家。分析用户与 AI 编程助手（Claude Code）的历史对话，"
+        "提炼出可复用的工作模式。输出简洁实用的 playbook，供另一个 AI 在代理用户向 Claude Code 发送指令时参考。\n\n"
+        "输出格式（中文）：\n"
+        "## 有效做法\n- 列出用户的好指令模式（具体、可操作）\n\n"
+        "## 应避免\n- 列出导致返工或低效的模式\n\n"
+        "## 项目约定\n- 列出该项目的隐含规范（代码风格、测试、提交习惯等）\n\n"
+        "## 常用工作流\n- 列出用户常见的任务模式（如：先读文件→再修改→跑测试→提交）"
+    )
+
+    async def _analyze_history_with_llm(self, formatted_convs: list[str],
+                                        work_dir: str,
+                                        event: AstrMessageEvent,
+                                        segment_threshold: int = 100000) -> str | None:
+        """调用 LLM 分析历史对话，生成 playbook。
+
+        内容超过 segment_threshold 时自动分段：串行逐段总结，
+        每段携带前段摘要以保持连贯性。
+        """
+        try:
+            umo = event.unified_msg_origin
+            prov = self.plugin.context.get_using_provider(umo=umo)
+            if not prov:
+                logger.warning("[playbook] 未找到可用的 LLM provider")
+                return None
+        except Exception as e:
+            logger.warning("[playbook] 获取 LLM provider 失败: %s", e)
+            return None
+
+        combined = "\n\n".join(formatted_convs)
+
+        # 进度通知辅助
+        async def _notify(text: str):
+            try:
+                await event.send(MessageChain().message(text))
+            except Exception:
+                pass
+
+        # ── 短内容：一次性总结 ──
+        if len(combined) <= segment_threshold:
+            await _notify("🔍 正在分析对话记录...")
+            return await self._llm_summarize_segment(
+                prov, work_dir, combined, prev_summary=None,
+            )
+
+        # ── 长内容：按行分段，超过阈值时在完整行边界切断 ──
+        all_lines = combined.split("\n")
+        segments: list[str] = []
+        current_lines: list[str] = []
+        current_len = 0
+        for line in all_lines:
+            line_len = len(line) + 1  # +1 for \n
+            if current_len + line_len > segment_threshold and current_lines:
+                segments.append("\n".join(current_lines))
+                current_lines = []
+                current_len = 0
+            current_lines.append(line)
+            current_len += line_len
+        if current_lines:
+            segments.append("\n".join(current_lines))
+
+        logger.info("[playbook] 分 %d 段总结，总长 %d 字符", len(segments), len(combined))
+
+        # 根据配置选择串行（携带上段摘要）或并行总结
+        parallel = self.plugin.config.get("playbook_parallel", False)
+
+        if parallel:
+            # ── 并行：所有段同时总结，最后合并 ──
+            logger.info("[playbook] 并行总结 %d 段...", len(segments))
+            await _notify(f"🔍 正在并行分析 {len(segments)} 段内容...")
+            tasks = [
+                self._llm_summarize_segment(
+                    prov, work_dir, seg, prev_summary=None,
+                    segment_info=f"第 {i + 1}/{len(segments)} 段",
+                )
+                for i, seg in enumerate(segments)
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            all_segment_summaries = [
+                r for r in results if isinstance(r, str) and r
+            ]
+            await _notify(f"✔ 并行分析完成，{len(all_segment_summaries)}/{len(segments)} 段成功")
+        else:
+            # ── 串行：逐段携带前段摘要 ──
+            all_segment_summaries: list[str] = []
+            prev_summary: str | None = None
+            for i, segment in enumerate(segments):
+                logger.info("[playbook] 正在总结第 %d/%d 段 (%d 字符)...", i + 1, len(segments), len(segment))
+                await _notify(f"🔍 正在分析第 {i + 1}/{len(segments)} 段...")
+                result = await self._llm_summarize_segment(
+                    prov, work_dir, segment, prev_summary=prev_summary,
+                    segment_info=f"第 {i + 1}/{len(segments)} 段",
+                )
+                if result:
+                    prev_summary = result
+                    all_segment_summaries.append(result)
+                else:
+                    logger.warning("[playbook] 第 %d 段总结失败，使用前段结果", i + 1)
+
+        if not all_segment_summaries:
+            return None
+
+        # 只有一段时直接返回
+        if len(all_segment_summaries) == 1:
+            return all_segment_summaries[0]
+
+        # 最终合并：将所有段的 playbook 一起总结成最终版本
+        logger.info("[playbook] 正在合并 %d 段摘要生成最终 playbook...", len(all_segment_summaries))
+        await _notify(f"📝 正在合并 {len(all_segment_summaries)} 段分析结果生成最终 playbook...")
+        merged = await self._llm_merge_summaries(prov, work_dir, all_segment_summaries)
+        # 合并失败时回退到最后一段的结果
+        return merged or all_segment_summaries[-1]
+
+    async def _llm_summarize_segment(self, prov, work_dir: str,
+                                     segment_text: str,
+                                     prev_summary: str | None = None,
+                                     segment_info: str = "") -> str | None:
+        """对单个段落调用 LLM 生成/更新 playbook"""
+        if prev_summary:
+            prompt = (
+                f"以下是用户在项目 {work_dir} 中与 Claude Code 的历史对话记录（{segment_info}）。\n\n"
+                f"前面内容的分析结果：\n{prev_summary}\n\n"
+                f"---\n\n"
+                f"请结合上述已有分析和以下新内容，生成更完整的 playbook：\n\n{segment_text}"
+            )
+        else:
+            prompt = f"以下是用户在项目 {work_dir} 中与 Claude Code 的历史对话记录：\n\n{segment_text}"
+
+        try:
+            resp = await prov.text_chat(
+                system_prompt=self._PLAYBOOK_SYSTEM_PROMPT,
+                prompt=prompt,
+            )
+            return resp.completion_text.strip() or None
+        except Exception as e:
+            logger.warning("[playbook] LLM 分析失败: %s", e)
+            return None
+
+    async def _llm_merge_summaries(self, prov, work_dir: str,
+                                   summaries: list[str]) -> str | None:
+        """将多段 playbook 摘要合并为最终版本"""
+        numbered = "\n\n".join(
+            f"--- 第 {i + 1} 段分析 ---\n{s}" for i, s in enumerate(summaries)
+        )
+        prompt = (
+            f"以下是对项目 {work_dir} 的历史对话分 {len(summaries)} 段分析后的结果。\n"
+            "请将所有段的分析合并为一份完整的最终 playbook，去除重复内容，保留所有独特的洞察：\n\n"
+            f"{numbered}"
+        )
+        try:
+            resp = await prov.text_chat(
+                system_prompt=self._PLAYBOOK_SYSTEM_PROMPT,
+                prompt=prompt,
+            )
+            return resp.completion_text.strip() or None
+        except Exception as e:
+            logger.warning("[playbook] 合并摘要失败: %s", e)
+            return None
 
     # ──── 操作类工具（需要审批）────
 

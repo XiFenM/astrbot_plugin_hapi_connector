@@ -17,6 +17,7 @@ class StateManager:
         self._user_states_cache: dict[str, dict] = {}
         self._session_owners = binding_mgr._session_owners
         self._session_capabilities: dict[str, dict] = {}  # F2: 会话能力缓存（内存，不持久化）
+        self._playbooks: dict[str, str] = {}  # F13: playbook 缓存，key = work_dir
 
     # ──── 会话能力缓存 ────
 
@@ -31,6 +32,32 @@ class StateManager:
     def clear_capabilities(self, sid: str):
         """清除会话的能力缓存"""
         self._session_capabilities.pop(sid, None)
+
+    # ──── Playbook 缓存 (F13) ────
+
+    def set_playbook(self, key: str, playbook: str):
+        """缓存 playbook（key 为工作目录路径或 sid）"""
+        self._playbooks[key] = playbook
+
+    def get_playbook(self, key: str) -> str | None:
+        """获取 playbook（key 为工作目录路径或 sid）"""
+        return self._playbooks.get(key)
+
+    def clear_playbook(self, key: str):
+        """清除 playbook 缓存"""
+        self._playbooks.pop(key, None)
+
+    async def persist_playbook(self, key: str):
+        """持久化 playbook 到 KV（key 为工作目录路径）"""
+        playbook = self._playbooks.get(key)
+        # 用 work_dir 作为 KV key，与 session 生命周期解耦
+        kv_key = f"playbook_{key}"
+        await self.kv.put_kv_data(kv_key, playbook if playbook else None)
+
+    async def persist_playbook_index(self):
+        """持久化 playbook 索引（所有 key 列表）"""
+        keys = list(self._playbooks.keys())
+        await self.kv.put_kv_data("playbook_keys", keys)
 
     # ──── 持久化 ────
 
@@ -316,6 +343,17 @@ class StateManager:
                     window_state.get("current_session", ""),
                     window_state.get("current_flavor", "")
                 )
+
+        # F13: 加载已持久化的 playbooks（按工作目录索引，独立于 session 生命周期）
+        playbook_keys = await self.kv.get_kv_data("playbook_keys", [])
+        for key in playbook_keys:
+            if not isinstance(key, str):
+                continue
+            playbook = await self.kv.get_kv_data(f"playbook_{key}", None)
+            if playbook and isinstance(playbook, str):
+                self._playbooks[key] = playbook
+        if self._playbooks:
+            logger.info("已加载 %d 个 playbook", len(self._playbooks))
 
     async def migrate_to_capture_model(self):
         """数据迁移：绑定模式 → 捕获+默认窗口模式"""
