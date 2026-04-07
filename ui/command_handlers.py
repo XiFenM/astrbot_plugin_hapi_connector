@@ -76,6 +76,8 @@ class CommandHandlers:
             "routes": (self.cmd_routes, False),
             "caps": (self.cmd_caps, True),
             "learn": (self.cmd_learn, True),
+            "takeover": (self.cmd_takeover, True),
+            "tk": (self.cmd_takeover, True),
         }
         route = routes.get(subcommand)
         if route is None:
@@ -382,36 +384,41 @@ class CommandHandlers:
 
     async def cmd_model(self, event: AstrMessageEvent, mode: str = ""):
         """查看/切换模型: /hapi model [模式名]"""
-        from .constants import MODEL_MODES
         await self.state_mgr.set_user_state(event)
         sid = self.state_mgr.effective_sid(event)
         if not sid:
             yield event.plain_result("请先用 /hapi sw <序号> 选择一个 session")
             return
 
-        flavor = self.state_mgr.effective_flavor(event) or "claude"
-        if flavor != "claude":
-            yield event.plain_result("模型切换仅支持 Claude session")
+        # 动态获取可用模型
+        try:
+            model_data = await session_ops.fetch_session_models(self.client, sid)
+        except Exception:
+            yield event.plain_result("获取模型信息失败")
             return
+
+        presets = model_data.get("presets", [])
+        if not presets:
+            flavor = model_data.get("flavor", "unknown")
+            yield event.plain_result(f"当前代理类型 {flavor} 不支持模型切换")
+            return
+
+        preset_ids = ["default"] + [p.get("id", "?") for p in presets]
 
         if mode:
             target = mode
-            if mode.isdigit() and 1 <= int(mode) <= len(MODEL_MODES):
-                target = MODEL_MODES[int(mode) - 1]
-            if target not in MODEL_MODES:
-                yield event.plain_result(f"❌ 无效模式: {mode}\n可用: {', '.join(MODEL_MODES)}")
+            if mode.isdigit() and 1 <= int(mode) <= len(preset_ids):
+                target = preset_ids[int(mode) - 1]
+            # 允许预设或自定义模型名（如果 supportsCustomModel）
+            if target not in preset_ids and not model_data.get("supportsCustomModel"):
+                yield event.plain_result(f"❌ 无效模型: {mode}\n可用: {', '.join(preset_ids)}")
                 return
             ok, msg = await session_ops.set_model_mode(self.client, sid, target)
             yield event.plain_result(msg)
         else:
-            try:
-                detail = await session_ops.fetch_session_detail(self.client, sid)
-                current = detail.get("modelMode", "default")
-                text = formatters.format_model_modes(MODEL_MODES, current)
-                yield event.plain_result(text)
-            except Exception:
-                yield event.plain_result("获取模型信息失败")
-                return
+            current = model_data.get("currentModel") or "auto"
+            text = formatters.format_model_modes(preset_ids, current)
+            yield event.plain_result(text)
 
             @session_waiter(timeout=30, record_history_chains=False)
             async def model_waiter(controller: SessionController, ev: AstrMessageEvent):
@@ -420,10 +427,10 @@ class CommandHandlers:
                     controller.keep(timeout=30, reset_timeout=True)
                     return
                 target = reply
-                if reply.isdigit() and 1 <= int(reply) <= len(MODEL_MODES):
-                    target = MODEL_MODES[int(reply) - 1]
-                if target not in MODEL_MODES:
-                    await ev.send(ev.plain_result(f"无效模式，可用: {', '.join(MODEL_MODES)}"))
+                if reply.isdigit() and 1 <= int(reply) <= len(preset_ids):
+                    target = preset_ids[int(reply) - 1]
+                if target not in preset_ids and not model_data.get("supportsCustomModel"):
+                    await ev.send(ev.plain_result(f"无效模型，可用: {', '.join(preset_ids)}"))
                 else:
                     ok, msg = await session_ops.set_model_mode(self.client, sid, target)
                     await ev.send(ev.plain_result(msg))
@@ -1468,3 +1475,43 @@ class CommandHandlers:
         await self.plugin._refresh_sessions()
 
         yield event.plain_result("✓ 已重置所有状态\n捕获关系和窗口状态已清空，默认窗口和 flavor 默认路由已保留")
+
+    # ── takeover ──
+
+    async def cmd_takeover(self, event: AstrMessageEvent, args: str = ""):
+        """Takeover 全盘接管: /hapi takeover [status|pause|resume|cancel]"""
+        mgr = getattr(self.plugin, 'takeover_mgr', None)
+        if not mgr:
+            yield event.plain_result("当前未启用 takeover 模式。\n请在插件配置中设置 auto_decision_mode = takeover")
+            return
+
+        await self.state_mgr.set_user_state(event)
+        sid = self.state_mgr.effective_sid(event)
+        if not sid:
+            yield event.plain_result("请先用 /hapi sw <序号> 选择一个 session")
+            return
+
+        sub = args.strip().lower()
+
+        if not sub or sub == "status":
+            plan = mgr.get_plan(sid)
+            if not plan:
+                yield event.plain_result("当前 session 无 takeover 计划。")
+            else:
+                yield event.plain_result(mgr.format_plan_status(plan))
+        elif sub == "pause":
+            result = await mgr.control(sid, "pause")
+            yield event.plain_result(result)
+        elif sub == "resume":
+            result = await mgr.control(sid, "resume")
+            yield event.plain_result(result)
+        elif sub == "cancel":
+            result = await mgr.control(sid, "cancel")
+            yield event.plain_result(result)
+        else:
+            yield event.plain_result(
+                "用法: /hapi takeover [子命令]\n"
+                "  status  — 查看当前计划和进度（默认）\n"
+                "  pause   — 暂停执行（当前任务完成后）\n"
+                "  resume  — 恢复执行\n"
+                "  cancel  — 取消计划")

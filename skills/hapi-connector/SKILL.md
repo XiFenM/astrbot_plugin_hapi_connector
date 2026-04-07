@@ -42,12 +42,21 @@ description: 通过 hapi_coding 工具调用远程 AI 编程助手（Claude Code
 - 遵循项目特定的约定（测试、提交、代码风格）
 - 避免用户已知的低效模式
 
+## 会话管理操作
+
+以下操作有**专用工具**，**不要**通过 `send_message` 发送指令来完成：
+
+- **切换模型**: `hapi_coding_list_models` 查看可用模型 → `hapi_coding_switch_model` 切换（Claude/Gemini 支持）
+- **上下文压缩**: `hapi_coding_compact_context` 触发压缩（上下文过长时使用）
+- **停止任务**: `hapi_coding_stop_message` 停止当前任务
+
 ## 关键规则
 
 - 用户说"帮我写/改/修XXX" → 调用编程助手，而非自己生成代码
 - `send_message` 后**不要**立即查询状态，等待 SSE 自动推送
 - 构造指令时要清晰具体，包含文件路径、需求细节
 - 如果系统提示中显示了当前会话的能力（MCP/Skills/Commands），在指令中可以引用
+- **切换模型、压缩上下文等操作使用专用工具，不要用 send_message 发送 /compact 或其他命令**
 
 ## 指令构造示例
 
@@ -59,5 +68,21 @@ description: 通过 hapi_coding 工具调用远程 AI 编程助手（Claude Code
 差的指令：
 - "帮我改一下代码"（太模糊）
 - "写一个完整的电商系统"（范围太大，应拆分）
+
+## Takeover 全盘接管模式
+
+当 auto_decision_mode = takeover 时，可使用全盘接管工作流，适合复杂多步骤目标：
+
+1. 用户描述最终目标 → 调用 `hapi_coding_takeover_plan` 规划任务列表
+2. 系统展示任务计划，用户确认或提出修改意见
+3. 用户确认后 → 调用 `hapi_coding_takeover_control(action="start")` 开始执行
+4. 系统自动逐步执行任务，每完成一个自动评估并推进下一个
+5. 执行期间用户可随时：
+   - `hapi_coding_takeover_status` 查看进度
+   - `hapi_coding_takeover_control(action="pause")` 暂停
+   - `hapi_coding_takeover_control(action="resume")` 恢复
+   - `hapi_coding_takeover_control(action="cancel")` 取消
+
+注意：takeover 继承 auto 模式的全部审批能力，高风险操作仍会上报。
 
 详细用法见 [ADVANCED.md](ADVANCED.md)，问题排查见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。

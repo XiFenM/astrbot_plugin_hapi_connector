@@ -259,6 +259,28 @@ class HapiConnectorPlugin(Star):
         async for result in self.llm_integration.tool_stop_message(event):
             yield result
 
+    @filter.llm_tool(name="hapi_coding_list_models")
+    async def tool_list_models(self, event: AstrMessageEvent):
+        '''列出当前 session 可用的模型列表及当前模型。'''
+        async for result in self.llm_integration.tool_list_models(event):
+            yield result
+
+    @filter.llm_tool(name="hapi_coding_switch_model")
+    async def tool_switch_model(self, event: AstrMessageEvent, model: str):
+        '''切换当前 session 的模型（Claude / Gemini 支持）。请先调用 hapi_coding_list_models 查看可用模型。
+
+        Args:
+            model(string): 目标模型名称，如 sonnet / opus / opus[1m] / gemini-2.5-pro 等，或 default 恢复自动选择
+        '''
+        async for result in self.llm_integration.tool_switch_model(event, model):
+            yield result
+
+    @filter.llm_tool(name="hapi_coding_compact_context")
+    async def tool_compact_context(self, event: AstrMessageEvent):
+        '''触发当前 session 的上下文压缩。上下文过长时使用，无需等待系统提示。'''
+        async for result in self.llm_integration.tool_compact_context(event):
+            yield result
+
     @filter.llm_tool(name="hapi_coding_execute_command")
     async def tool_execute_command(self, event: AstrMessageEvent, command: str):
         '''直接执行HAPI指令。使用前请务必调用hapi_coding_list_commands查看指令格式和参数说明。
@@ -267,6 +289,35 @@ class HapiConnectorPlugin(Star):
             command(string): 完整的/hapi指令，不含/hapi前缀
         '''
         async for result in self.llm_integration.tool_execute_command(event, command):
+            yield result
+
+    # ──── Takeover 工具代理 ────
+
+    @filter.llm_tool(name="hapi_coding_takeover_plan")
+    async def tool_takeover_plan(self, event: AstrMessageEvent, goal: str, modification: str = ""):
+        '''为当前 session 创建或修改 Takeover 任务计划。用户描述最终目标后，LLM 自动规划多步骤任务列表。
+
+        Args:
+            goal(string): 最终目标描述
+            modification(string): 对现有计划的修改意见（可选，用于调整已有计划）
+        '''
+        async for result in self.llm_integration.tool_takeover_plan(event, goal, modification):
+            yield result
+
+    @filter.llm_tool(name="hapi_coding_takeover_status")
+    async def tool_takeover_status(self, event: AstrMessageEvent):
+        '''查看当前 session 的 Takeover 任务计划和执行进度。'''
+        async for result in self.llm_integration.tool_takeover_status(event):
+            yield result
+
+    @filter.llm_tool(name="hapi_coding_takeover_control")
+    async def tool_takeover_control(self, event: AstrMessageEvent, action: str):
+        '''控制 Takeover 任务执行。
+
+        Args:
+            action(string): start=开始执行已确认的计划 / pause=暂停（当前任务完成后） / resume=恢复执行 / cancel=取消计划
+        '''
+        async for result in self.llm_integration.tool_takeover_control(event, action):
             yield result
 
     # ──── 辅助方法 ────
@@ -429,10 +480,19 @@ class HapiConnectorPlugin(Star):
             auto_decision_mode = "auto"
 
         auto_decision_mgr = None
-        if auto_decision_mode in ("auto", "suggest"):
+        self.takeover_mgr = None
+        if auto_decision_mode in ("auto", "suggest", "takeover"):
             from .llm.auto_decision import AutoDecisionManager
-            auto_decision_mgr = AutoDecisionManager(self, mode=auto_decision_mode)
-            logger.info("LLM 决策已启用，模式: %s", auto_decision_mode)
+            # takeover 继承 auto 的全部决策能力
+            effective_mode = "auto" if auto_decision_mode == "takeover" else auto_decision_mode
+            auto_decision_mgr = AutoDecisionManager(self, mode=effective_mode)
+            logger.info("LLM 决策已启用，模式: %s (effective: %s)", auto_decision_mode, effective_mode)
+
+        if auto_decision_mode == "takeover":
+            from .llm.takeover_manager import TakeoverManager
+            self.takeover_mgr = TakeoverManager(self)
+            self.takeover_mgr.recover_from_restart()
+            logger.info("Takeover 全盘接管模式已启用")
 
         self.sse_listener.start(
             output_level,
@@ -444,6 +504,7 @@ class HapiConnectorPlugin(Star):
             summary_msg_count=self._summary_msg_count,
             max_reconnect_attempts=max_reconnect,
             auto_decision_mgr=auto_decision_mgr,
+            takeover_mgr=self.takeover_mgr,
         )
         logger.info("HAPI Connector 已初始化，SSE 输出级别: %s", output_level)
 

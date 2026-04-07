@@ -8,8 +8,23 @@ PERMISSION_MODES = {
     "opencode": ["default", "yolo"],
 }
 
-# Claude 可用的模型模式
-MODEL_MODES = ["default", "sonnet", "opus"]
+# Claude 可用的模型预设（null/Auto 在 API 中用 None 表示）
+CLAUDE_MODEL_PRESETS = ["sonnet", "sonnet[1m]", "opus", "opus[1m]"]
+
+# Gemini 可用的模型预设
+GEMINI_MODEL_PRESETS = [
+    "gemini-3.1-pro-preview",
+    "gemini-3-flash-preview",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+]
+
+# 支持模型切换的 flavor
+MODEL_SWITCH_FLAVORS = {"claude", "gemini"}
+
+# 向后兼容：旧的 MODEL_MODES（含 default 表示 auto）
+MODEL_MODES = ["default"] + CLAUDE_MODEL_PRESETS
 
 # Codex 可用的思考深度；None 表示继承 Codex 默认设置
 CODEX_REASONING_EFFORT_OPTIONS = [

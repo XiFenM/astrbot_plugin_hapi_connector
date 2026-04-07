@@ -64,8 +64,11 @@ class SSEListener:
         self._request_notify_sids: set[str] = set()
         self._request_notify_task: asyncio.Task | None = None
         self._auto_decision_mgr: "AutoDecisionManager | None" = None
+        self._takeover_mgr = None  # TakeoverManager | None
         # {sid: {"pre_send_seq": int, "ts": float}}，tool_send_message 注册的完成回调上下文
         self._pending_llm_completions: dict[str, dict] = {}
+        # {sid: {"pre_send_seq": int, "ts": float, "task_id": str}}，takeover 独立完成回调
+        self._pending_takeover_completions: dict[str, dict] = {}
         # F7: SSE 断连通知状态
         self._disconnect_notified: bool = False
         self._disconnect_notify_task: asyncio.Task | None = None
@@ -73,11 +76,12 @@ class SSEListener:
     def start(self, output_level: str = "summary", remind_pending: bool = False, remind_interval: int = 180,
               auto_approve_enabled: bool = False, auto_approve_start: str = "23:00", auto_approve_end: str = "07:00",
               summary_msg_count: int = 5, max_reconnect_attempts: int = 0,
-              auto_decision_mgr=None):
+              auto_decision_mgr=None, takeover_mgr=None):
         """启动 SSE 监听任务"""
         self.output_level = output_level
         self._summary_msg_count = summary_msg_count
         self._auto_decision_mgr = auto_decision_mgr
+        self._takeover_mgr = takeover_mgr
         self._remind_enabled = remind_pending
         self._remind_interval = remind_interval
         self._auto_approve_enabled = auto_approve_enabled
@@ -388,6 +392,7 @@ class SSEListener:
         if old_thinking and not is_thinking:
             async with self._lock:
                 pending_count = len(self.pending.get(sid, {}))
+            logger.info("[SSE] thinking→idle edge: sid=%s, pending=%d", sid[:8], pending_count)
             if pending_count == 0:
                 self._completion_sids.add(sid)
                 if self._completion_task is None or self._completion_task.done():
@@ -602,6 +607,8 @@ class SSEListener:
                 async with self._lock:
                     state = self.session_states.get(sid, {})
                     has_pending = len(self.pending.get(sid, {})) > 0
+                logger.debug("[completion] sid=%s thinking=%s pending=%s lastSeq=%s",
+                             sid[:8], state.get("thinking"), has_pending, state.get("lastSeq"))
                 if not state.get("thinking", False) and not has_pending:
                     last_seq = state.get("lastSeq", 0)
                     if self.output_level == "summary":
@@ -613,10 +620,29 @@ class SSEListener:
 
                     async with self._lock:
                         last_seq = self.session_states.get(sid, {}).get("lastSeq", last_seq)
-                    if last_seq <= self._completion_notified_seqs.get(sid, -1):
+                    prev_notified = self._completion_notified_seqs.get(sid, -1)
+                    if last_seq <= prev_notified:
+                        logger.debug("[completion] sid=%s dedup: last_seq=%d <= notified=%d",
+                                     sid[:8], last_seq, prev_notified)
                         continue
+
+                    # Takeover 完成回调（独立于 tool_send_message 的回调）
+                    takeover_ctx = self._pending_takeover_completions.pop(sid, None)
+                    if takeover_ctx and self._takeover_mgr:
+                        try:
+                            response = await self._plugin.llm_integration._fetch_completion_response(
+                                sid, takeover_ctx["pre_send_seq"])
+                            await self._takeover_mgr.on_task_completed(sid, response)
+                        except Exception as e:
+                            logger.warning("[takeover] completion error: %s (sid=%s)", e, sid[:8])
+                        self._completion_notified_seqs[sid] = last_seq
+                        continue  # takeover 自行处理通知，跳过下面的通用通知
+
                     # 如果有 tool_send_message 注册的回调，调用 LLM 生成回复
-                    await self._llm_reply_completion(sid)
+                    try:
+                        await self._llm_reply_completion(sid)
+                    except Exception as e:
+                        logger.warning("[completion] LLM 回复异常: %s (sid=%s)", e, sid[:8])
 
                     label = session_label_short(sid, self.sessions_cache)
                     self._completion_notified_seqs[sid] = last_seq
@@ -634,6 +660,7 @@ class SSEListener:
                         lines.append(f"  ⏱ 耗时: {duration_text}")
                     if summary_text:
                         lines.append(f"  📋 {summary_text}")
+                    logger.info("[completion] pushing notification for sid=%s, last_seq=%d", sid[:8], last_seq)
                     await self._push_notification("\n".join(lines), sid)
             if not self._completion_sids:
                 break
@@ -690,14 +717,137 @@ class SSEListener:
                     ]
                     await self._push_notification("\n".join(lines), sid)
 
-            # 检测 Compaction completed → 自动发送「继续」恢复会话
+            # 检测 Compaction completed → 根据 auto_decision 配置决定后续
             if seq > last_completed and "compaction completed" in text_lower:
+                logger.info("[compact] detected 'compaction completed' sid=%s seq=%d", sid[:8], seq)
                 self._compaction_completed_seqs[sid] = seq
-                label = session_label_short(sid, self.sessions_cache)
-                ok, _ = await session_ops.send_message(self.client, sid, "继续")
-                mark = "✓" if ok else "✗"
-                await self._push_notification(
-                    f"[上下文压缩完成] 已自动发送「继续」\n{label}\n  {mark}", sid)
+                await self._handle_compaction_completed(sid)
+
+    async def _handle_compaction_completed(self, sid: str):
+        """上下文压缩完成后的处理。
+
+        Takeover 模式：由 takeover manager 处理恢复（带任务上下文）
+        其他模式：三步流程（embed → LLM 建议 → 根据模式决定）
+        """
+        # Takeover 模式优先
+        if self._takeover_mgr and self._takeover_mgr.is_active(sid):
+            await self._takeover_mgr.on_compaction_completed(sid)
+            return
+
+        """三步流程：
+        1. HAPI 的压缩完成消息由 SSE 正常流程展示为 embed（自动发生）
+        2. 调用 LLM 生成下一步建议，以常规 AstrBot 消息发送给用户
+        3. 根据 auto_decision 模式：
+           - auto: 自动构建指令发送给 HAPI，并告知用户
+           - suggest: 展示建议，由用户决定
+           - off: 仅通知压缩完成，不生成建议
+        """
+        label = session_label_short(sid, self.sessions_cache)
+
+        # ── 准备 UMO 和 provider ──
+        targets = self._plugin.state_mgr.select_notification_targets(sid, self.sessions_cache)
+        umo = targets[0] if targets else None
+        if not umo:
+            logger.warning("[compaction] 无可用通知目标 sid=%s", sid[:8])
+            await self._push_notification(
+                f"[上下文压缩完成] 会话等待输入\n{label}\n"
+                "  请发送消息恢复会话，或使用 /hapi msg <内容>", sid)
+            return
+
+        mode = self._auto_decision_mgr.mode if self._auto_decision_mgr else "off"
+
+        # off 模式：仅通知，不调用 LLM
+        if mode == "off":
+            await self._send_user_message(umo,
+                f"上下文压缩已完成（{label}）。\n"
+                "请发送消息恢复会话，或使用 /hapi msg <内容>")
+            return
+
+        # ── auto/suggest: 调用 LLM 生成恢复建议 ──
+        resume_msg = await self._generate_resume_suggestion(sid, umo)
+        if not resume_msg:
+            logger.warning("[compaction] LLM 生成建议失败 sid=%s", sid[:8])
+            await self._send_user_message(umo,
+                f"上下文压缩已完成（{label}），但自动生成恢复建议失败。\n"
+                "请手动发送消息恢复会话，或使用 /hapi msg <内容>")
+            return
+
+        if mode == "auto":
+            # ── auto 模式：告知用户建议 + 自动发送 ──
+            logger.info("[compaction] auto-resume sid=%s, msg_len=%d", sid[:8], len(resume_msg))
+            # 记录发送前序号，用于完成后 LLM 总结
+            async with self._lock:
+                pre_send_seq = self.session_states.get(sid, {}).get("lastSeq", 0)
+            ok, _ = await session_ops.send_message(self.client, sid, resume_msg)
+            if ok:
+                # 注册完成回调，HAPI 处理完后触发 LLM 总结
+                import time
+                self._pending_llm_completions[sid] = {
+                    "pre_send_seq": pre_send_seq,
+                    "ts": time.monotonic(),
+                }
+                logger.info("[compaction] registered completion callback sid=%s", sid[:8])
+            mark = "✅ 已自动发送" if ok else "❌ 发送失败"
+            await self._send_user_message(umo,
+                f"上下文压缩已完成（{label}）。\n\n"
+                f"根据之前的任务上下文，我向 Claude Code 发送了以下恢复指令：\n\n"
+                f"> {resume_msg}\n\n"
+                f"{mark}，处理完成后会自动通知结果。")
+        elif mode == "suggest":
+            # ── suggest 模式：展示建议，让用户决定 ──
+            logger.info("[compaction] suggest sid=%s, msg_len=%d", sid[:8], len(resume_msg))
+            await self._send_user_message(umo,
+                f"上下文压缩已完成（{label}）。\n\n"
+                f"根据之前的任务上下文，建议向 Claude Code 发送以下恢复指令：\n\n"
+                f"> {resume_msg}\n\n"
+                "如需发送，请回复确认或直接使用 /hapi msg <内容> 自定义恢复消息。")
+
+    async def _send_user_message(self, umo: str, text: str):
+        """以常规 AstrBot 消息（非 embed 通知）发送给用户"""
+        from astrbot.api.event import MessageChain
+        try:
+            chain = MessageChain().message(text)
+            await self._plugin.context.send_message(umo, chain)
+        except Exception as e:
+            logger.warning("[compaction] 发送用户消息失败: %s", e)
+
+    async def _generate_resume_suggestion(self, sid: str, umo: str) -> str | None:
+        """调用 AstrBot LLM 生成压缩后的恢复指令建议。"""
+        try:
+            context = self._plugin.context
+            prov_id = await context.get_current_chat_provider_id(umo=umo)
+            if not prov_id:
+                return None
+
+            # 读取对话上下文
+            conv_mgr = context.conversation_manager
+            conv_id = await conv_mgr.get_curr_conversation_id(umo)
+            history_contexts = None
+            if conv_id:
+                conversation = await conv_mgr.get_conversation(umo, conv_id)
+                if conversation and conversation.history:
+                    import json
+                    history_contexts = json.loads(conversation.history)
+
+            prompt = (
+                "[Claude Code 上下文压缩完成]\n"
+                "你之前通过 hapi_coding_send_message 向 Claude Code 提交了编程任务。"
+                "Claude Code 因上下文过长自动进行了压缩，现在需要一条消息来恢复会话继续执行。\n\n"
+                "请根据之前的对话上下文，生成一条发送给 Claude Code 的恢复指令。\n"
+                "指令应简洁明确，提醒 Claude Code 当前进展和下一步要做的事情。\n"
+                "直接输出指令内容，不要包含解释、前缀或引号。"
+            )
+
+            llm_resp = await context.llm_generate(
+                chat_provider_id=prov_id,
+                prompt=prompt,
+                contexts=history_contexts,
+            )
+            result = llm_resp.completion_text.strip() if llm_resp.completion_text else None
+            return result or None
+        except Exception as e:
+            logger.warning("[compaction] LLM 生成恢复建议失败: %s", e)
+            return None
 
     async def _debounced_compact_check(self):
         """silence 模式下防抖检测 Prompt is too long"""

@@ -70,13 +70,15 @@ class PendingManager:
                 future.set_result(True)
 
         for sid, rid, success in results:
-            if success:
-                self.remove_entry(sid, rid)
+            # 无论成功或失败（如 404 Request not found），都从 pending 中移除
+            # 失败通常意味着请求已不存在（被 Claude Code 自行处理或超时），
+            # 保留在 pending 中会阻塞完成通知
+            self.remove_entry(sid, rid)
 
         success_count = sum(1 for _, _, ok in results if ok)
         fail_count = len(results) - success_count
         if fail_count > 0:
-            return f"✅ 已批准 {success_count} 项，❌ 失败 {fail_count} 项"
+            return f"✅ 已批准 {success_count} 项，❌ 失败 {fail_count} 项（失败项已自动清理）"
         return f"✅ 已批准 {success_count} 项"
 
     async def answer_questions_interactive(self, event: AstrMessageEvent, items: list[tuple[str, str, dict]],
