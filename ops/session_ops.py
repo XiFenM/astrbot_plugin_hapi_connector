@@ -419,12 +419,22 @@ async def find_cc_history_dir(client: AsyncHapiClient, sid: str,
 
 
 async def read_cc_conversations(client: AsyncHapiClient, sid: str,
-                                history_dir: str) -> list[dict]:
-    """读取 Claude Code 历史目录下所有 JSONL 对话文件，全量提取关键片段。
+                                history_dir: str,
+                                max_files: int = 8,
+                                max_file_bytes: int = 500_000) -> list[dict]:
+    """读取 Claude Code 历史目录下最近 N 个 JSONL 对话文件，并行提取关键片段。
+
+    Args:
+        max_files: 最多读取的文件数（最新优先），默认 8
+        max_file_bytes: 单文件大小上限（字节），超过则跳过，默认 500KB
 
     Returns:
         [{filename, turns: [{role, text/tool, ...}]}]  按修改时间从新到旧排序
     """
+    import asyncio as _asyncio
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
     entries = await list_directory(client, sid, history_dir)
     jsonl_files = sorted(
         [e for e in entries if e.get("name", "").endswith(".jsonl")],
@@ -432,21 +442,44 @@ async def read_cc_conversations(client: AsyncHapiClient, sid: str,
         reverse=True,
     )
 
-    conversations = []
+    # 限制文件数，并跳过超大文件
+    selected = []
+    skipped_large = 0
     for f in jsonl_files:
+        if len(selected) >= max_files:
+            break
+        size = f.get("size", 0) or 0
+        if size > max_file_bytes:
+            skipped_large += 1
+            _log.debug("[playbook] 跳过大文件 %s (%d bytes)", f["name"], size)
+            continue
+        selected.append(f)
+
+    if skipped_large:
+        _log.info("[playbook] 跳过 %d 个超大文件 (> %d bytes)", skipped_large, max_file_bytes)
+
+    async def _read_one(f: dict) -> dict | None:
         path = f"{history_dir}/{f['name']}"
         ok, b64_content = await read_file(client, sid, path)
         if not ok:
-            continue
+            return None
         try:
             text = base64.b64decode(b64_content).decode("utf-8", errors="replace")
         except Exception:
-            continue
-
+            return None
         turns = _extract_key_turns(text)
-        if turns:
-            conversations.append({"filename": f["name"], "turns": turns})
+        return {"filename": f["name"], "turns": turns} if turns else None
 
+    # 并行读取所有选中文件
+    results = await _asyncio.gather(*[_read_one(f) for f in selected], return_exceptions=True)
+    conversations = []
+    for f, r in zip(selected, results):
+        if isinstance(r, Exception):
+            _log.warning("[playbook] 读取 %s 失败: %s", f["name"], r)
+        elif r is not None:
+            conversations.append(r)
+
+    # 恢复按时间排序（gather 保持顺序，但明确一下）
     return conversations
 
 
