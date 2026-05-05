@@ -193,14 +193,16 @@ class HapiConnectorPlugin(Star):
             yield result
 
     @filter.llm_tool(name="hapi_coding_learn_history")
-    async def tool_learn_history(self, event: AstrMessageEvent, session_target: str = ""):
+    async def tool_learn_history(self, event: AstrMessageEvent,
+                                 session_target: str = "", machine_id: str = ""):
         '''分析指定 session 的 Claude Code 历史对话，学习有效的工作模式，生成 playbook 供后续指令构造参考。
         首次向某个 session 发送编程任务前，建议先调用此工具学习该项目的历史经验。
 
         Args:
             session_target(string): 目标 session 序号或 ID 前缀（可选，默认当前 session）
+            machine_id(string): 机器 ID（可选；session 无法自动关联机器时必填，可通过 hapi_coding_list_machines 查询）
         '''
-        async for result in self.llm_integration.tool_learn_from_history(event, session_target):
+        async for result in self.llm_integration.tool_learn_from_history(event, session_target, machine_id):
             yield result
 
     @filter.llm_tool(name="hapi_coding_send_message")

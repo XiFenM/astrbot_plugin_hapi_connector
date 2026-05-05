@@ -507,12 +507,17 @@ quick_prefix (快捷前缀): {quick_prefix}
             return ""
         return f"{mid}:{wd}" if mid else wd
 
-    async def tool_learn_from_history(self, event: AstrMessageEvent, session_target: str = ""):
-        '''分析指定 session 的 Claude Code 历史对话，学习有效的工作模式并生成 playbook。'''
+    async def tool_learn_from_history(self, event: AstrMessageEvent,
+                                      session_target: str = "", machine_id: str = ""):
+        '''分析指定 session 的 Claude Code 历史对话，学习有效的工作模式并生成 playbook。
+
+        Args:
+            session_target(string): 目标 session 序号或 ID 前缀（可选，默认当前 session）
+            machine_id(string): 机器 ID（可选；session 无法自动关联机器时必填，可通过 hapi_coding_list_machines 查询）
+        '''
         # 解析目标 session
         sid = None
         if session_target.strip():
-            # 尝试序号或 ID 前缀
             target = session_target.strip()
             if target.isdigit():
                 visible = self.state_mgr.visible_sessions_for_window(event, self.sessions_cache)
@@ -542,30 +547,8 @@ quick_prefix (快捷前缀): {quick_prefix}
 
         yield f"📚 正在查找 {work_dir} 的 Claude Code 历史记录..."
 
-        # HAPI 目录 API 对不可访问路径返回空列表而非错误，
-        # 因此无法通过探测判断可访问性。策略：
-        # 1. 先用原 session 尝试（如果 work_dir 恰好能访问 .claude/projects 则直接成功）
-        # 2. 找不到历史时，创建工作目录为 / 的临时 session（可访问所有路径）重试
-        machine_id = session.get("machineId", "")
-        # sessions_cache 的列表接口可能不含 machineId，依次尝试：
-        # 1. session 详情接口
-        if not machine_id:
-            try:
-                detail = await session_ops.fetch_session_detail(self.client, sid)
-                machine_id = detail.get("machineId", "")
-            except Exception as e:
-                logger.debug("[playbook] 获取 session 详情失败: %s", e)
-        # 2. 单机场景：只有一台机器时直接取其 id
-        if not machine_id:
-            try:
-                machines = await session_ops.fetch_machines(self.client)
-                if len(machines) == 1:
-                    machine_id = machines[0].get("id", "")
-                    logger.debug("[playbook] 单机模式，使用机器 id: %s", machine_id)
-                elif len(machines) > 1:
-                    logger.warning("[playbook] session 无 machineId 且有多台机器，无法确定目标机器")
-            except Exception as e:
-                logger.debug("[playbook] 获取机器列表失败: %s", e)
+        # 确定 machine_id：优先使用调用方传入的值，其次从 session 对象读取
+        machine_id = machine_id.strip() or session.get("machineId", "")
         file_sid = sid
         temp_sid: str | None = None
         logger.debug("[playbook] session=%s machine_id=%r work_dir=%r", sid[:8], machine_id, work_dir)
@@ -575,7 +558,11 @@ quick_prefix (快捷前缀): {quick_prefix}
             history_dir = await session_ops.find_cc_history_dir(self.client, file_sid, work_dir)
 
             if not history_dir and not machine_id:
-                yield "⚠️ 该 session 没有 machineId，无法创建临时会话访问历史目录"
+                yield (
+                    "⚠️ 无法访问 Claude Code 历史目录，且未提供 machine_id\n"
+                    "请通过 hapi_coding_list_machines 查询机器 ID 后重试，"
+                    "例如：hapi_coding_learn_history(machine_id='<id>')"
+                )
                 return
 
             if not history_dir and machine_id:

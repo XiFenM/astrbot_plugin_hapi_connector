@@ -1446,8 +1446,13 @@ class CommandHandlers:
     # ── learn (F13) ──
 
     async def cmd_learn(self, event: AstrMessageEvent, args: str = ""):
-        """分析历史对话生成 playbook: /hapi learn [session]"""
-        async for result in self.plugin.llm_integration.tool_learn_from_history(event, args):
+        """分析历史对话生成 playbook: /hapi learn [session] [machine_id]"""
+        parts = args.strip().split()
+        session_target = parts[0] if parts else ""
+        machine_id = parts[1] if len(parts) >= 2 else ""
+        async for result in self.plugin.llm_integration.tool_learn_from_history(
+            event, session_target, machine_id
+        ):
             if isinstance(result, str):
                 yield event.plain_result(result)
             else:
