@@ -362,12 +362,19 @@ async def find_cc_history_dir(client: AsyncHapiClient, sid: str,
 
     Claude Code 路径规则: ~/.claude/projects/{path_with_dashes}/
     例如 /root/workspace/host → /root/.claude/projects/-root-workspace-host/
+
+    注意：HAPI 目录 API 对不可访问路径返回空列表而非 4xx，
+    因此唯一可靠的可访问性判断是"返回了 .jsonl 文件"。
+    调用方应在原 session 返回 None 时创建根目录临时 session 重试。
     """
     import logging as _logging
     _log = _logging.getLogger(__name__)
 
     home_dir = _guess_home_dir(work_dir)
     projects_base = f"{home_dir}/.claude/projects"
+
+    def _has_jsonl(entries: list) -> bool:
+        return any(e.get("name", "").endswith(".jsonl") for e in entries)
 
     # 方案 A：直接按路径规则精确匹配
     hash_name = work_dir.rstrip("/").replace("/", "-")
@@ -376,12 +383,13 @@ async def find_cc_history_dir(client: AsyncHapiClient, sid: str,
     candidate = f"{projects_base}/{hash_name}"
     _log.debug("[playbook] 方案A 候选路径: %s (work_dir=%s)", candidate, work_dir)
     try:
-        await list_directory(client, sid, candidate)
-        # list_directory 不抛异常即代表目录存在（即使目录为空也算找到）
-        _log.debug("[playbook] 方案A 成功找到: %s", candidate)
-        return candidate
+        entries = await list_directory(client, sid, candidate)
+        if _has_jsonl(entries):
+            _log.debug("[playbook] 方案A 成功找到: %s (%d jsonl)", candidate, len(entries))
+            return candidate
+        _log.debug("[playbook] 方案A 路径存在但无 jsonl（不可访问或为空）: %s", candidate)
     except Exception as e:
-        _log.debug("[playbook] 方案A 失败 (%s): %s", candidate, e)
+        _log.debug("[playbook] 方案A 异常 (%s): %s", candidate, e)
 
     # 方案 B：枚举 ~/.claude/projects/ 并按路径各段逐级匹配
     try:
@@ -396,8 +404,11 @@ async def find_cc_history_dir(client: AsyncHapiClient, sid: str,
                 if entry.get("type") != "directory":
                     continue
                 name = entry.get("name", "")
-                if segment and segment in name:
-                    found = f"{projects_base}/{name}"
+                if not (segment and segment in name):
+                    continue
+                found = f"{projects_base}/{name}"
+                sub = await list_directory(client, sid, found)
+                if _has_jsonl(sub):
                     _log.debug("[playbook] 方案B 匹配: segment=%s → %s", segment, found)
                     return found
     except Exception as e:

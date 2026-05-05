@@ -542,44 +542,38 @@ quick_prefix (快捷前缀): {quick_prefix}
 
         yield f"📚 正在查找 {work_dir} 的 Claude Code 历史记录..."
 
-        # 获取可用于文件操作的 sid（原 session 可能不活跃）
+        # HAPI 目录 API 对不可访问路径返回空列表而非错误，
+        # 因此无法通过探测判断可访问性。策略：
+        # 1. 先用原 session 尝试（如果 work_dir 恰好能访问 .claude/projects 则直接成功）
+        # 2. 找不到历史时，创建工作目录为 / 的临时 session（可访问所有路径）重试
         machine_id = session.get("machineId", "")
-        file_sid = sid  # 默认用原 session
-        temp_sid: str | None = None  # 临时 session，用完归档
-
-        # 探测是否能访问 ~/.claude/projects/（而非 /root）
-        # HAPI 目录 API 只允许访问 session work_dir 的祖先路径 + 子路径，
-        # .claude/projects 通常是 work_dir 的兄弟路径，无法直接访问
-        from ..ops.session_ops import _guess_home_dir
-        home_dir = _guess_home_dir(work_dir)
-        projects_base = f"{home_dir}/.claude/projects"
-        can_access_projects = False
-        try:
-            await session_ops.list_directory(self.client, file_sid, projects_base)
-            can_access_projects = True
-        except Exception:
-            can_access_projects = False
-        logger.debug("[playbook] 探测 %s 可访问=%s (sid=%s)", projects_base, can_access_projects, file_sid[:8])
-
-        if not can_access_projects and machine_id:
-            # 原 session 不可用，在目标机器的 / 创建临时 session
-            logger.info("[playbook] 原 session 文件系统不可访问，创建临时 session...")
-            yield "🔄 正在创建临时会话以访问文件系统..."
-            ok, msg, new_sid = await session_ops.spawn_session(
-                self.client, machine_id, "/", "claude",
-            )
-            if ok and new_sid:
-                file_sid = new_sid
-                temp_sid = new_sid
-                logger.info("[playbook] 临时 session 已创建: %s", new_sid[:8])
-            else:
-                logger.warning("[playbook] 临时 session 创建失败: %s", msg)
-                yield f"⚠️ 无法创建临时会话访问文件系统: {msg}"
-                return
+        file_sid = sid
+        temp_sid: str | None = None
 
         try:
-            # 定位历史目录
+            # 第一次尝试：用原 session
             history_dir = await session_ops.find_cc_history_dir(self.client, file_sid, work_dir)
+
+            if not history_dir and machine_id:
+                # .claude/projects 通常是 work_dir 的兄弟路径，原 session 无法访问
+                # 创建根目录临时 session，它能访问机器上所有路径
+                logger.info("[playbook] 原 session 无法访问历史目录，创建根目录临时 session...")
+                yield "🔄 正在创建临时会话以访问 Claude Code 历史..."
+                ok, msg, new_sid = await session_ops.spawn_session(
+                    self.client, machine_id, "/", "claude",
+                )
+                if ok and new_sid:
+                    file_sid = new_sid
+                    temp_sid = new_sid
+                    logger.info("[playbook] 临时 session 已创建: %s", new_sid[:8])
+                    history_dir = await session_ops.find_cc_history_dir(
+                        self.client, file_sid, work_dir,
+                    )
+                else:
+                    logger.warning("[playbook] 临时 session 创建失败: %s", msg)
+                    yield f"⚠️ 无法创建临时会话: {msg}"
+                    return
+
             if not history_dir:
                 from ..ops.session_ops import _guess_home_dir
                 home = _guess_home_dir(work_dir)
