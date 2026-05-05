@@ -573,7 +573,14 @@ quick_prefix (快捷前缀): {quick_prefix}
             # 定位历史目录
             history_dir = await session_ops.find_cc_history_dir(self.client, file_sid, work_dir)
             if not history_dir:
-                yield "未找到该工作目录的 Claude Code 历史记录（路径: ~/.claude/projects/）"
+                from ..ops.session_ops import _guess_home_dir
+                home = _guess_home_dir(work_dir)
+                yield (
+                    f"未找到 Claude Code 历史记录\n"
+                    f"  work_dir: {work_dir}\n"
+                    f"  已搜索: {home}/.claude/projects/\n"
+                    f"  请确认 Claude Code 曾在该目录运行过，或检查 debug 日志"
+                )
                 return
 
             # 读取对话

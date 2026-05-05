@@ -346,6 +346,16 @@ async def _safe_fetch(fn, *args):
         return None
 
 
+def _guess_home_dir(work_dir: str) -> str:
+    """从工作目录推导 home 目录（/root 或 /home/xxx）"""
+    parts = (work_dir or "").split("/")
+    if len(parts) >= 2 and parts[1] == "root":
+        return "/root"
+    if len(parts) >= 3 and parts[1] == "home":
+        return f"/home/{parts[2]}"
+    return "/root"
+
+
 async def find_cc_history_dir(client: AsyncHapiClient, sid: str,
                               work_dir: str) -> str | None:
     """根据 session 工作目录推算 Claude Code 历史目录路径。
@@ -353,31 +363,47 @@ async def find_cc_history_dir(client: AsyncHapiClient, sid: str,
     Claude Code 路径规则: ~/.claude/projects/{path_with_dashes}/
     例如 /root/workspace/host → /root/.claude/projects/-root-workspace-host/
     """
-    # 方案 A：直接按路径规则推算
-    hash_name = work_dir.replace("/", "-")
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
+    home_dir = _guess_home_dir(work_dir)
+    projects_base = f"{home_dir}/.claude/projects"
+
+    # 方案 A：直接按路径规则精确匹配
+    hash_name = work_dir.rstrip("/").replace("/", "-")
     if not hash_name.startswith("-"):
         hash_name = "-" + hash_name
-    candidate = f"/root/.claude/projects/{hash_name}"
+    candidate = f"{projects_base}/{hash_name}"
+    _log.debug("[playbook] 方案A 候选路径: %s (work_dir=%s)", candidate, work_dir)
     try:
-        entries = await list_directory(client, sid, candidate)
-        if entries:
-            return candidate
-    except Exception:
-        pass
+        await list_directory(client, sid, candidate)
+        # list_directory 不抛异常即代表目录存在（即使目录为空也算找到）
+        _log.debug("[playbook] 方案A 成功找到: %s", candidate)
+        return candidate
+    except Exception as e:
+        _log.debug("[playbook] 方案A 失败 (%s): %s", candidate, e)
 
-    # 方案 B：遍历 ~/.claude/projects/ 找匹配目录
+    # 方案 B：枚举 ~/.claude/projects/ 并按路径各段逐级匹配
     try:
-        projects = await list_directory(client, sid, "/root/.claude/projects")
-        last_part = work_dir.rstrip("/").split("/")[-1]
-        for entry in projects:
-            if entry.get("type") != "directory":
-                continue
-            name = entry.get("name", "")
-            if last_part and last_part in name:
-                return f"/root/.claude/projects/{name}"
-    except Exception:
-        pass
+        projects = await list_directory(client, sid, projects_base)
+        _log.debug("[playbook] 方案B 扫描 %s，共 %d 个条目", projects_base, len(projects))
 
+        # 从最具体的路径段到最宽泛，依次尝试
+        path_parts = [p for p in work_dir.rstrip("/").split("/") if p]
+        for i in range(len(path_parts), 0, -1):
+            segment = path_parts[i - 1]
+            for entry in projects:
+                if entry.get("type") != "directory":
+                    continue
+                name = entry.get("name", "")
+                if segment and segment in name:
+                    found = f"{projects_base}/{name}"
+                    _log.debug("[playbook] 方案B 匹配: segment=%s → %s", segment, found)
+                    return found
+    except Exception as e:
+        _log.warning("[playbook] 方案B 失败 (projects_base=%s): %s", projects_base, e)
+
+    _log.warning("[playbook] 无法找到历史目录: work_dir=%s, home_dir=%s", work_dir, home_dir)
     return None
 
 
