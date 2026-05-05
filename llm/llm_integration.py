@@ -547,13 +547,25 @@ quick_prefix (快捷前缀): {quick_prefix}
         # 1. 先用原 session 尝试（如果 work_dir 恰好能访问 .claude/projects 则直接成功）
         # 2. 找不到历史时，创建工作目录为 / 的临时 session（可访问所有路径）重试
         machine_id = session.get("machineId", "")
-        # sessions_cache 的列表接口可能不含 machineId，尝试从详情补全
+        # sessions_cache 的列表接口可能不含 machineId，依次尝试：
+        # 1. session 详情接口
         if not machine_id:
             try:
                 detail = await session_ops.fetch_session_detail(self.client, sid)
                 machine_id = detail.get("machineId", "")
             except Exception as e:
                 logger.debug("[playbook] 获取 session 详情失败: %s", e)
+        # 2. 单机场景：只有一台机器时直接取其 id
+        if not machine_id:
+            try:
+                machines = await session_ops.fetch_machines(self.client)
+                if len(machines) == 1:
+                    machine_id = machines[0].get("id", "")
+                    logger.debug("[playbook] 单机模式，使用机器 id: %s", machine_id)
+                elif len(machines) > 1:
+                    logger.warning("[playbook] session 无 machineId 且有多台机器，无法确定目标机器")
+            except Exception as e:
+                logger.debug("[playbook] 获取机器列表失败: %s", e)
         file_sid = sid
         temp_sid: str | None = None
         logger.debug("[playbook] session=%s machine_id=%r work_dir=%r", sid[:8], machine_id, work_dir)
