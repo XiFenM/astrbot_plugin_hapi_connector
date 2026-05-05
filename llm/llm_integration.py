@@ -8,6 +8,11 @@ from ..ops import session_ops
 from ..ui import formatters
 
 
+def _get_machine_id(session: dict) -> str:
+    """从 session 对象提取 machineId（兼容顶层和 metadata 内两种位置）"""
+    return session.get("machineId", "") or session.get("metadata", {}).get("machineId", "")
+
+
 class LLMIntegration:
     """LLM 工具集成管理器"""
 
@@ -90,7 +95,7 @@ class LLMIntegration:
         seen_playbook_keys: set[str] = set()
         for s in visible_sessions[:5]:
             work_dir = s.get("metadata", {}).get("path", "")
-            machine_id = s.get("machineId", "")
+            machine_id = _get_machine_id(s)
             pb_key = self._playbook_key(machine_id, work_dir)
             if not pb_key or pb_key in seen_playbook_keys:
                 continue
@@ -508,12 +513,11 @@ quick_prefix (快捷前缀): {quick_prefix}
         return f"{mid}:{wd}" if mid else wd
 
     async def tool_learn_from_history(self, event: AstrMessageEvent,
-                                      session_target: str = "", machine_id: str = ""):
+                                      session_target: str = ""):
         '''分析指定 session 的 Claude Code 历史对话，学习有效的工作模式并生成 playbook。
 
         Args:
             session_target(string): 目标 session 序号或 ID 前缀（可选，默认当前 session）
-            machine_id(string): 机器 ID（可选；session 无法自动关联机器时必填，可通过 hapi_coding_list_machines 查询）
         '''
         # 解析目标 session
         sid = None
@@ -535,7 +539,7 @@ quick_prefix (快捷前缀): {quick_prefix}
             yield "未找到目标 session，请先切换到一个 session 或指定 session ID"
             return
 
-        # 获取 session 工作目录
+        # 获取 session 信息
         session = next((s for s in self.sessions_cache if s.get("id") == sid), None)
         if not session:
             yield "session 信息不可用"
@@ -544,97 +548,66 @@ quick_prefix (快捷前缀): {quick_prefix}
         if not work_dir:
             yield "该 session 没有工作目录信息"
             return
+        machine_id = _get_machine_id(session)
+        if not machine_id:
+            yield "该 session 没有关联机器信息，无法访问历史记录"
+            return
 
         yield f"📚 正在查找 {work_dir} 的 Claude Code 历史记录..."
-
-        # 确定 machine_id：优先使用调用方传入的值，其次从 session 对象读取
-        machine_id = machine_id.strip() or session.get("machineId", "")
-        file_sid = sid
-        temp_sid: str | None = None
         logger.debug("[playbook] session=%s machine_id=%r work_dir=%r", sid[:8], machine_id, work_dir)
 
-        try:
-            # 第一次尝试：用原 session
-            history_dir = await session_ops.find_cc_history_dir(self.client, file_sid, work_dir)
-
-            if not history_dir and not machine_id:
-                yield (
-                    "⚠️ 无法访问 Claude Code 历史目录，且未提供 machine_id\n"
-                    "请通过 hapi_coding_list_machines 查询机器 ID 后重试，"
-                    "例如：hapi_coding_learn_history(machine_id='<id>')"
-                )
-                return
-
-            if not history_dir and machine_id:
-                # .claude/projects 通常是 work_dir 的兄弟路径，原 session 无法访问
-                # 创建根目录临时 session，它能访问机器上所有路径
-                logger.info("[playbook] 原 session 无法访问历史目录，创建根目录临时 session...")
-                yield "🔄 正在创建临时会话以访问 Claude Code 历史..."
-                ok, msg, new_sid = await session_ops.spawn_session(
-                    self.client, machine_id, "/", "claude",
-                )
-                if ok and new_sid:
-                    file_sid = new_sid
-                    temp_sid = new_sid
-                    logger.info("[playbook] 临时 session 已创建: %s", new_sid[:8])
-                    history_dir = await session_ops.find_cc_history_dir(
-                        self.client, file_sid, work_dir,
-                    )
-                else:
-                    logger.warning("[playbook] 临时 session 创建失败: %s", msg)
-                    yield f"⚠️ 无法创建临时会话: {msg}"
-                    return
-
-            if not history_dir:
-                from ..ops.session_ops import _guess_home_dir
-                home = _guess_home_dir(work_dir)
-                yield (
-                    f"未找到 Claude Code 历史记录\n"
-                    f"  work_dir: {work_dir}\n"
-                    f"  已搜索: {home}/.claude/projects/\n"
-                    f"  请确认 Claude Code 曾在该目录运行过，或检查 debug 日志"
-                )
-                return
-
-            # 读取对话
-            conversations = await session_ops.read_cc_conversations(
-                self.client, file_sid, history_dir,
+        # ① 定位历史目录
+        history_dir = await session_ops.find_cc_history_dir(self.client, machine_id, work_dir)
+        if not history_dir:
+            from ..ops.session_ops import _guess_home_dir
+            home = _guess_home_dir(work_dir)
+            yield (
+                f"未找到 Claude Code 历史记录\n"
+                f"  work_dir: {work_dir}\n"
+                f"  已搜索: {home}/.claude/projects/\n"
+                f"  请确认 Claude Code 曾在该目录运行过"
             )
-            if not conversations:
-                yield "历史目录下没有找到对话记录"
-                return
-        finally:
-            # 清理临时 session
-            if temp_sid:
-                logger.info("[playbook] 归档临时 session %s", temp_sid[:8])
-                try:
-                    await session_ops.archive_session(self.client, temp_sid)
-                except Exception as e:
-                    logger.warning("[playbook] 临时 session 归档失败: %s", e)
+            return
 
-        # 格式化对话内容
+        yield f"📂 找到历史目录，正在读取对话文件..."
+
+        # ② 读取对话
+        conversations, stats = await session_ops.read_cc_conversations(
+            self.client, machine_id, history_dir,
+        )
+        if not conversations:
+            yield (f"历史目录下没有找到有效对话记录"
+                   f"（共 {stats['total']} 个文件，{stats['filtered']} 个过滤，{stats['failed']} 个失败）")
+            return
+
+        # ③ 格式化
         formatted_convs = self._format_conversations(conversations)
         combined = "\n\n".join(formatted_convs)
         total_len = len(combined)
 
-        yield f"📖 找到 {len(conversations)} 个历史对话，内容总长度 {total_len:,} 字符"
+        stat_detail = f"共 {stats['total']} 个文件，{stats['valid']} 个有效"
+        if stats["filtered"]:
+            stat_detail += f"，{stats['filtered']} 个过滤（对话过短）"
+        if stats["failed"]:
+            stat_detail += f"，{stats['failed']} 个失败"
+        yield f"📖 {stat_detail}，内容总长度 {total_len:,} 字符"
 
-        # 长度超过阈值时分段总结（从插件配置读取，默认 100000）
+        # ④ LLM 分析（async generator，每步都有 yield 刷新超时）
         segment_threshold = self.plugin.config.get("playbook_segment_size", 100000)
-        if total_len > segment_threshold:
-            segment_count = (total_len + segment_threshold - 1) // segment_threshold
-            yield f"⚠️ 内容较长（{total_len:,} 字符），将分 {segment_count} 段逐步总结，每段携带前段摘要以保持连贯性。"
-
-        # 调用 LLM 分析（自动处理分段）
-        playbook = await self._analyze_history_with_llm(
+        playbook = None
+        async for msg in self._analyze_history_with_llm(
             formatted_convs, work_dir, event, segment_threshold,
-        )
+        ):
+            if isinstance(msg, str) and msg.startswith("__RESULT__:"):
+                playbook = msg[len("__RESULT__:"):]
+            else:
+                yield msg
+
         if not playbook:
             yield "LLM 分析失败，请稍后重试"
             return
 
-        # 存储 playbook（按 machine_id:work_dir，独立于 session 生命周期）
-        machine_id = session.get("machineId", "")
+        # ⑤ 存储
         pb_key = self._playbook_key(machine_id, work_dir)
         self.state_mgr.set_playbook(pb_key, playbook)
         await self.state_mgr.persist_playbook(pb_key)
@@ -645,72 +618,105 @@ quick_prefix (快捷前缀): {quick_prefix}
 
     @staticmethod
     def _format_conversations(conversations: list[dict]) -> list[str]:
-        """将对话列表格式化为 LLM 可读的文本段落列表（每个对话一个段落）"""
+        """将对话列表格式化为 LLM 可读的文本段落列表（每个对话一个段落）。
+
+        重点保留用户指令和助手文字回复；连续工具调用折叠为一行摘要，
+        减少篇幅以聚焦用户行为模式。
+        """
         formatted = []
         for conv in conversations:
             lines = [f"=== 对话: {conv['filename']} ==="]
+            pending_tools: list[str] = []
+
+            def _flush_tools():
+                if not pending_tools:
+                    return
+                if len(pending_tools) <= 3:
+                    lines.append(f"  [工具] {' → '.join(pending_tools)}")
+                else:
+                    lines.append(
+                        f"  [工具] {pending_tools[0]} → ... → {pending_tools[-1]}"
+                        f"（共 {len(pending_tools)} 次调用）"
+                    )
+                pending_tools.clear()
+
             for turn in conv["turns"]:
-                if turn["role"] == "user":
-                    lines.append(f"[用户指令] {turn['text']}")
-                elif turn["role"] == "tool_use":
-                    lines.append(f"[工具调用] {turn['tool']}: {turn.get('input_preview', '')}")
-                elif turn["role"] == "assistant":
-                    lines.append(f"[助手回复] {turn['text']}")
+                if turn["role"] == "tool_use":
+                    preview = turn.get("input_preview", "")
+                    tool_desc = f"{turn['tool']}({preview})" if preview else turn["tool"]
+                    pending_tools.append(tool_desc)
+                else:
+                    _flush_tools()
+                    if turn["role"] == "user":
+                        lines.append(f"[用户] {turn['text']}")
+                    elif turn["role"] == "assistant":
+                        lines.append(f"[助手] {turn['text']}")
+
+            _flush_tools()
             formatted.append("\n".join(lines))
         return formatted
 
     _PLAYBOOK_SYSTEM_PROMPT = (
-        "你是编程助手使用模式分析专家。分析用户与 AI 编程助手（Claude Code）的历史对话，"
-        "提炼出可复用的工作模式。输出简洁实用的 playbook，供另一个 AI 在代理用户向 Claude Code 发送指令时参考。\n\n"
-        "输出格式（中文）：\n"
-        "## 有效做法\n- 列出用户的好指令模式（具体、可操作）\n\n"
-        "## 应避免\n- 列出导致返工或低效的模式\n\n"
-        "## 项目约定\n- 列出该项目的隐含规范（代码风格、测试、提交习惯等）\n\n"
-        "## 常用工作流\n- 列出用户常见的任务模式（如：先读文件→再修改→跑测试→提交）"
+        "你是「用户行为模式」分析专家。你的任务是从用户与 AI 编码工具（Claude Code）的历史对话中，"
+        "提炼出**用户**的行为模式和偏好——而非编码工具本身的行为。\n\n"
+        "分析重点：\n"
+        "- 用户如何描述需求、分解任务、给出指令\n"
+        "- 用户在不同场景（新功能、bug 修复、重构、调试等）下的典型行为流程\n"
+        "- 用户对结果的验证习惯（是否要求测试、是否检查日志、是否要求分步执行等）\n"
+        "- 用户的沟通风格和偏好（简洁 vs 详细、中文 vs 英文、是否给上下文等）\n"
+        "- 用户纠正编码工具时暴露出的隐含偏好和项目约定\n\n"
+        "注意：对话中 [工具] 标记的是编码工具的内部操作，仅作为上下文参考，"
+        "不要分析或总结编码工具的行为模式，只关注用户的行为。\n\n"
+        "输出格式（中文，简洁实用）：\n"
+        "## 用户指令风格\n- 用户下达指令的典型方式和特点\n\n"
+        "## 场景行为模式\n- 用户在不同开发场景下的行为流程\n\n"
+        "## 隐含偏好与约定\n- 从用户的纠正和反馈中提炼出的项目规范和个人偏好\n\n"
+        "## 典型工作流\n- 用户常见的端到端任务模式（如：描述问题→要求定位→确认方案→要求实现→验证测试）"
     )
 
     async def _analyze_history_with_llm(self, formatted_convs: list[str],
                                         work_dir: str,
                                         event: AstrMessageEvent,
-                                        segment_threshold: int = 100000) -> str | None:
-        """调用 LLM 分析历史对话，生成 playbook。
+                                        segment_threshold: int = 100000):
+        """调用 LLM 分析历史对话，生成 playbook（async generator）。
 
-        内容超过 segment_threshold 时自动分段：串行逐段总结，
-        每段携带前段摘要以保持连贯性。
+        yield 进度消息（str），最终结果以 "__RESULT__:" 前缀 yield。
+        内容超过 segment_threshold 时自动分段。
         """
         try:
             umo = event.unified_msg_origin
             prov = self.plugin.context.get_using_provider(umo=umo)
             if not prov:
                 logger.warning("[playbook] 未找到可用的 LLM provider")
-                return None
+                return
         except Exception as e:
             logger.warning("[playbook] 获取 LLM provider 失败: %s", e)
-            return None
+            return
 
         combined = "\n\n".join(formatted_convs)
 
-        # 进度通知辅助
-        async def _notify(text: str):
-            try:
-                await event.send(MessageChain().message(text))
-            except Exception:
-                pass
-
         # ── 短内容：一次性总结 ──
         if len(combined) <= segment_threshold:
-            await _notify("🔍 正在分析对话记录...")
-            return await self._llm_summarize_segment(
+            yield "🔍 正在分析对话记录..."
+            result = None
+            async for msg in self._llm_summarize_segment(
                 prov, work_dir, combined, prev_summary=None,
-            )
+            ):
+                if isinstance(msg, str) and msg.startswith(self._LLMRESULT_PREFIX):
+                    result = msg[len(self._LLMRESULT_PREFIX):]
+                else:
+                    yield msg  # 透传心跳
+            if result:
+                yield f"__RESULT__:{result}"
+            return
 
-        # ── 长内容：按行分段，超过阈值时在完整行边界切断 ──
+        # ── 长内容：按行分段 ──
         all_lines = combined.split("\n")
         segments: list[str] = []
         current_lines: list[str] = []
         current_len = 0
         for line in all_lines:
-            line_len = len(line) + 1  # +1 for \n
+            line_len = len(line) + 1
             if current_len + line_len > segment_threshold and current_lines:
                 segments.append("\n".join(current_lines))
                 current_lines = []
@@ -721,37 +727,60 @@ quick_prefix (快捷前缀): {quick_prefix}
             segments.append("\n".join(current_lines))
 
         logger.info("[playbook] 分 %d 段总结，总长 %d 字符", len(segments), len(combined))
+        yield f"⚠️ 内容较长（{len(combined):,} 字符），将分 {len(segments)} 段逐步总结"
 
-        # 根据配置选择串行（携带上段摘要）或并行总结
+        RESULT_PREFIX = self._LLMRESULT_PREFIX
+
+        async def _consume_gen(gen) -> str | None:
+            """消费 async generator，丢弃心跳，返回 LLMRESULT（供并行模式使用）。"""
+            result = None
+            async for msg in gen:
+                if isinstance(msg, str) and msg.startswith(RESULT_PREFIX):
+                    result = msg[len(RESULT_PREFIX):]
+            return result
+
         parallel = self.plugin.config.get("playbook_parallel", False)
 
         if parallel:
-            # ── 并行：所有段同时总结，最后合并 ──
-            logger.info("[playbook] 并行总结 %d 段...", len(segments))
-            await _notify(f"🔍 正在并行分析 {len(segments)} 段内容...")
+            yield f"🔍 正在并行分析 {len(segments)} 段内容..."
             tasks = [
-                self._llm_summarize_segment(
+                _consume_gen(self._llm_summarize_segment(
                     prov, work_dir, seg, prev_summary=None,
                     segment_info=f"第 {i + 1}/{len(segments)} 段",
-                )
+                ))
                 for i, seg in enumerate(segments)
             ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            all_segment_summaries = [
-                r for r in results if isinstance(r, str) and r
-            ]
-            await _notify(f"✔ 并行分析完成，{len(all_segment_summaries)}/{len(segments)} 段成功")
+            # 用 wait + 超时循环代替 gather，定时 yield 心跳避免 AstrBot 120s 超时
+            import time as _time
+            pending = {asyncio.ensure_future(t) for t in tasks}
+            done_results: list = []
+            while pending:
+                finished, pending = await asyncio.wait(
+                    pending, timeout=60, return_when=asyncio.FIRST_EXCEPTION,
+                )
+                for f in finished:
+                    try:
+                        done_results.append(f.result())
+                    except Exception:
+                        done_results.append(None)
+                if pending:
+                    yield f"⏳ 并行分析中，已完成 {len(done_results)}/{len(segments)} 段..."
+            all_segment_summaries = [r for r in done_results if isinstance(r, str) and r]
+            yield f"✔ 并行分析完成，{len(all_segment_summaries)}/{len(segments)} 段成功"
         else:
-            # ── 串行：逐段携带前段摘要 ──
             all_segment_summaries: list[str] = []
             prev_summary: str | None = None
             for i, segment in enumerate(segments):
-                logger.info("[playbook] 正在总结第 %d/%d 段 (%d 字符)...", i + 1, len(segments), len(segment))
-                await _notify(f"🔍 正在分析第 {i + 1}/{len(segments)} 段...")
-                result = await self._llm_summarize_segment(
+                yield f"🔍 正在分析第 {i + 1}/{len(segments)} 段..."
+                result = None
+                async for msg in self._llm_summarize_segment(
                     prov, work_dir, segment, prev_summary=prev_summary,
                     segment_info=f"第 {i + 1}/{len(segments)} 段",
-                )
+                ):
+                    if isinstance(msg, str) and msg.startswith(RESULT_PREFIX):
+                        result = msg[len(RESULT_PREFIX):]
+                    else:
+                        yield msg  # 透传心跳
                 if result:
                     prev_summary = result
                     all_segment_summaries.append(result)
@@ -759,24 +788,32 @@ quick_prefix (快捷前缀): {quick_prefix}
                     logger.warning("[playbook] 第 %d 段总结失败，使用前段结果", i + 1)
 
         if not all_segment_summaries:
-            return None
+            return
 
-        # 只有一段时直接返回
         if len(all_segment_summaries) == 1:
-            return all_segment_summaries[0]
+            yield f"__RESULT__:{all_segment_summaries[0]}"
+            return
 
-        # 最终合并：将所有段的 playbook 一起总结成最终版本
-        logger.info("[playbook] 正在合并 %d 段摘要生成最终 playbook...", len(all_segment_summaries))
-        await _notify(f"📝 正在合并 {len(all_segment_summaries)} 段分析结果生成最终 playbook...")
-        merged = await self._llm_merge_summaries(prov, work_dir, all_segment_summaries)
-        # 合并失败时回退到最后一段的结果
-        return merged or all_segment_summaries[-1]
+        yield f"📝 正在合并 {len(all_segment_summaries)} 段分析结果..."
+        merged = None
+        async for msg in self._llm_merge_summaries(prov, work_dir, all_segment_summaries):
+            if isinstance(msg, str) and msg.startswith(RESULT_PREFIX):
+                merged = msg[len(RESULT_PREFIX):]
+            else:
+                yield msg  # 透传心跳
+        final = merged or all_segment_summaries[-1]
+        yield f"__RESULT__:{final}"
+
+    _LLMRESULT_PREFIX = "__LLMRESULT__:"
 
     async def _llm_summarize_segment(self, prov, work_dir: str,
                                      segment_text: str,
                                      prev_summary: str | None = None,
-                                     segment_info: str = "") -> str | None:
-        """对单个段落调用 LLM 生成/更新 playbook"""
+                                     segment_info: str = ""):
+        """对单个段落调用 LLM 生成/更新 playbook (async generator)。
+
+        中间 yield 心跳字符串，最后 yield "__LLMRESULT__:..." 携带结果。
+        """
         if prev_summary:
             prompt = (
                 f"以下是用户在项目 {work_dir} 中与 Claude Code 的历史对话记录（{segment_info}）。\n\n"
@@ -788,18 +825,14 @@ quick_prefix (快捷前缀): {quick_prefix}
             prompt = f"以下是用户在项目 {work_dir} 中与 Claude Code 的历史对话记录：\n\n{segment_text}"
 
         try:
-            resp = await prov.text_chat(
-                system_prompt=self._PLAYBOOK_SYSTEM_PROMPT,
-                prompt=prompt,
-            )
-            return resp.completion_text.strip() or None
+            async for msg in self._stream_text_chat(prov, self._PLAYBOOK_SYSTEM_PROMPT, prompt):
+                yield msg
         except Exception as e:
             logger.warning("[playbook] LLM 分析失败: %s", e)
-            return None
 
     async def _llm_merge_summaries(self, prov, work_dir: str,
-                                   summaries: list[str]) -> str | None:
-        """将多段 playbook 摘要合并为最终版本"""
+                                   summaries: list[str]):
+        """将多段 playbook 摘要合并为最终版本 (async generator)。"""
         numbered = "\n\n".join(
             f"--- 第 {i + 1} 段分析 ---\n{s}" for i, s in enumerate(summaries)
         )
@@ -809,14 +842,55 @@ quick_prefix (快捷前缀): {quick_prefix}
             f"{numbered}"
         )
         try:
-            resp = await prov.text_chat(
-                system_prompt=self._PLAYBOOK_SYSTEM_PROMPT,
-                prompt=prompt,
-            )
-            return resp.completion_text.strip() or None
+            async for msg in self._stream_text_chat(prov, self._PLAYBOOK_SYSTEM_PROMPT, prompt):
+                yield msg
         except Exception as e:
             logger.warning("[playbook] 合并摘要失败: %s", e)
-            return None
+
+    # ──── LLM 调用辅助 ────
+
+    @staticmethod
+    async def _stream_text_chat(prov, system_prompt: str, prompt: str):
+        """流式调用 LLM，每 60 秒 yield 心跳消息以避免 AstrBot 工具调用 120s 超时。
+
+        这是一个 async generator:
+        - 中间 yield 心跳字符串（调用方应透传给上层）
+        - 最后 yield "__LLMRESULT__:..." 携带最终结果
+        - 如果失败则不 yield LLMRESULT（调用方通过有无该前缀判断成功与否）
+
+        流式请求只要首个 token 在超时窗口内返回即可，后续 token 持续到达会保持连接。
+        如果 provider 不支持 text_chat_stream 则回退到 text_chat。
+        """
+        import time as _time
+
+        HEARTBEAT_INTERVAL = 60  # 秒，远小于 120s 超时
+
+        if not hasattr(prov, 'text_chat_stream'):
+            resp = await prov.text_chat(system_prompt=system_prompt, prompt=prompt)
+            text = resp.completion_text.strip() if resp.completion_text else None
+            if text:
+                yield f"__LLMRESULT__:{text}"
+            return
+
+        final_text: str | None = None
+        last_heartbeat = _time.monotonic()
+        token_count = 0
+
+        async for chunk in prov.text_chat_stream(
+            system_prompt=system_prompt,
+            prompt=prompt,
+        ):
+            if not chunk.is_chunk and chunk.result_chain:
+                final_text = chunk.completion_text
+            elif chunk.is_chunk and chunk.result_chain:
+                token_count += 1
+                now = _time.monotonic()
+                if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                    yield f"⏳ LLM 生成中（已接收约 {token_count} tokens）..."
+                    last_heartbeat = now
+
+        if final_text:
+            yield f"__LLMRESULT__:{final_text.strip()}"
 
     # ──── 操作类工具（需要审批）────
 
@@ -1178,7 +1252,7 @@ quick_prefix (快捷前缀): {quick_prefix}
         if not session:
             return None, None, None
 
-        machine_id = session.get("machineId", "")
+        machine_id = _get_machine_id(session)
         work_dir = session.get("metadata", {}).get("path", "")
         if not work_dir:
             return None, None, None
@@ -1209,8 +1283,11 @@ quick_prefix (快捷前缀): {quick_prefix}
             prov = self.plugin.context.get_using_provider(umo=umo)
             if not prov:
                 return None
-            resp = await prov.text_chat(system_prompt=system_prompt, prompt=prompt)
-            return resp.completion_text.strip() or None
+            result = None
+            async for msg in self._stream_text_chat(prov, system_prompt, prompt):
+                if isinstance(msg, str) and msg.startswith(self._LLMRESULT_PREFIX):
+                    result = msg[len(self._LLMRESULT_PREFIX):]
+            return result
         except Exception as e:
             logger.warning("[playbook] refine 失败: %s", e)
             return None

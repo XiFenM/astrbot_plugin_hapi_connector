@@ -750,7 +750,8 @@ class CommandHandlers:
                 # 借用该机器上已有 session 来浏览
                 borrowed_sid = None
                 for s in self.sessions_cache:
-                    if s.get("machineId") == mid:
+                    s_mid = s.get("machineId", "") or s.get("metadata", {}).get("machineId", "")
+                    if s_mid == mid:
                         borrowed_sid = s.get("id")
                         break
                 if borrowed_sid:
@@ -1446,12 +1447,10 @@ class CommandHandlers:
     # ── learn (F13) ──
 
     async def cmd_learn(self, event: AstrMessageEvent, args: str = ""):
-        """分析历史对话生成 playbook: /hapi learn [session] [machine_id]"""
-        parts = args.strip().split()
-        session_target = parts[0] if parts else ""
-        machine_id = parts[1] if len(parts) >= 2 else ""
+        """分析历史对话生成 playbook: /hapi learn [session]"""
+        session_target = args.strip()
         async for result in self.plugin.llm_integration.tool_learn_from_history(
-            event, session_target, machine_id
+            event, session_target
         ):
             if isinstance(result, str):
                 yield event.plain_result(result)

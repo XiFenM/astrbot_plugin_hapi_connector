@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import json
+import re
 import time
 
 from astrbot.api import logger
@@ -356,20 +357,13 @@ def _guess_home_dir(work_dir: str) -> str:
     return "/root"
 
 
-async def find_cc_history_dir(client: AsyncHapiClient, sid: str,
+async def find_cc_history_dir(client: AsyncHapiClient, machine_id: str,
                               work_dir: str) -> str | None:
-    """根据 session 工作目录推算 Claude Code 历史目录路径。
+    """根据工作目录推算 Claude Code 历史目录路径（使用 machine-level API，无路径限制）。
 
     Claude Code 路径规则: ~/.claude/projects/{path_with_dashes}/
     例如 /root/workspace/host → /root/.claude/projects/-root-workspace-host/
-
-    注意：HAPI 目录 API 对不可访问路径返回空列表而非 4xx，
-    因此唯一可靠的可访问性判断是"返回了 .jsonl 文件"。
-    调用方应在原 session 返回 None 时创建根目录临时 session 重试。
     """
-    import logging as _logging
-    _log = _logging.getLogger(__name__)
-
     home_dir = _guess_home_dir(work_dir)
     projects_base = f"{home_dir}/.claude/projects"
 
@@ -381,22 +375,21 @@ async def find_cc_history_dir(client: AsyncHapiClient, sid: str,
     if not hash_name.startswith("-"):
         hash_name = "-" + hash_name
     candidate = f"{projects_base}/{hash_name}"
-    _log.debug("[playbook] 方案A 候选路径: %s (work_dir=%s)", candidate, work_dir)
+    logger.debug("[playbook] 方案A 候选路径: %s (work_dir=%s)", candidate, work_dir)
     try:
-        entries = await list_directory(client, sid, candidate)
+        entries = await list_machine_directory(client, machine_id, candidate)
         if _has_jsonl(entries):
-            _log.debug("[playbook] 方案A 成功找到: %s (%d jsonl)", candidate, len(entries))
+            logger.info("[playbook] 方案A 成功找到: %s (%d 个条目)", candidate, len(entries))
             return candidate
-        _log.debug("[playbook] 方案A 路径存在但无 jsonl（不可访问或为空）: %s", candidate)
+        logger.debug("[playbook] 方案A 路径存在但无 jsonl: %s", candidate)
     except Exception as e:
-        _log.debug("[playbook] 方案A 异常 (%s): %s", candidate, e)
+        logger.debug("[playbook] 方案A 异常 (%s): %s", candidate, e)
 
     # 方案 B：枚举 ~/.claude/projects/ 并按路径各段逐级匹配
     try:
-        projects = await list_directory(client, sid, projects_base)
-        _log.debug("[playbook] 方案B 扫描 %s，共 %d 个条目", projects_base, len(projects))
+        projects = await list_machine_directory(client, machine_id, projects_base)
+        logger.debug("[playbook] 方案B 扫描 %s，共 %d 个条目", projects_base, len(projects))
 
-        # 从最具体的路径段到最宽泛，依次尝试
         path_parts = [p for p in work_dir.rstrip("/").split("/") if p]
         for i in range(len(path_parts), 0, -1):
             segment = path_parts[i - 1]
@@ -407,61 +400,198 @@ async def find_cc_history_dir(client: AsyncHapiClient, sid: str,
                 if not (segment and segment in name):
                     continue
                 found = f"{projects_base}/{name}"
-                sub = await list_directory(client, sid, found)
+                sub = await list_machine_directory(client, machine_id, found)
                 if _has_jsonl(sub):
-                    _log.debug("[playbook] 方案B 匹配: segment=%s → %s", segment, found)
+                    logger.info("[playbook] 方案B 匹配: segment=%s → %s", segment, found)
                     return found
     except Exception as e:
-        _log.warning("[playbook] 方案B 失败 (projects_base=%s): %s", projects_base, e)
+        logger.warning("[playbook] 方案B 失败 (projects_base=%s): %s", projects_base, e)
 
-    _log.warning("[playbook] 无法找到历史目录: work_dir=%s, home_dir=%s", work_dir, home_dir)
+    logger.warning("[playbook] 无法找到历史目录: work_dir=%s, home_dir=%s", work_dir, home_dir)
     return None
 
 
-async def read_cc_conversations(client: AsyncHapiClient, sid: str,
-                                history_dir: str) -> list[dict]:
-    """读取 Claude Code 历史目录下所有 JSONL 对话文件，并行提取关键片段。
+async def read_cc_conversations(client: AsyncHapiClient, machine_id: str,
+                                history_dir: str) -> tuple[list[dict], dict]:
+    """读取 Claude Code 历史目录下所有 JSONL 对话文件（使用 machine-level API），并行提取关键片段。
 
     Returns:
-        [{filename, turns: [{role, text/tool, ...}]}]  按修改时间从新到旧排序
+        (conversations, stats)
+        conversations: [{filename, turns: [{role, text/tool, ...}]}]  按修改时间从新到旧排序
+        stats: {"total": int, "valid": int, "filtered": int, "failed": int}
     """
     import asyncio as _asyncio
-    import logging as _logging
-    _log = _logging.getLogger(__name__)
 
-    entries = await list_directory(client, sid, history_dir)
+    entries = await list_machine_directory(client, machine_id, history_dir)
     jsonl_files = sorted(
         [e for e in entries if e.get("name", "").endswith(".jsonl")],
         key=lambda e: e.get("modified", ""),
         reverse=True,
     )
+    logger.info("[playbook] 目录 %s 扫描到 %d 个条目，其中 %d 个 .jsonl 文件",
+                history_dir, len(entries), len(jsonl_files))
+
+    semaphore = _asyncio.Semaphore(3)  # 限制并发，避免 RPC 通道拥堵
+    MIN_TURNS = 3  # 对话至少包含 3 个 turn 才有分析价值
 
     async def _read_one(f: dict) -> dict | None:
-        path = f"{history_dir}/{f['name']}"
-        ok, b64_content = await read_file(client, sid, path)
-        if not ok:
-            return None
-        try:
-            text = base64.b64decode(b64_content).decode("utf-8", errors="replace")
-        except Exception:
-            return None
-        turns = _extract_key_turns(text)
-        return {"filename": f["name"], "turns": turns} if turns else None
+        async with semaphore:
+            fname = f["name"]
+            path = f"{history_dir}/{fname}"
+            ok, b64_content = await read_machine_file(client, machine_id, path)
+            if not ok:
+                logger.warning("[playbook] 读取失败 %s: %s", fname, b64_content)
+                return None
+            try:
+                text = base64.b64decode(b64_content).decode("utf-8", errors="replace")
+            except Exception as e:
+                logger.warning("[playbook] 解码失败 %s: %s", fname, e)
+                return None
+            turns = _extract_key_turns(text)
+            if not turns:
+                logger.info("[playbook] 跳过 %s: 未提取到任何 turn", fname)
+                return None
+            # 过滤过于简短的对话（如只有一条 "hello" 的空 session）
+            has_assistant = any(t["role"] in ("assistant", "tool_use") for t in turns)
+            if len(turns) < MIN_TURNS and not has_assistant:
+                logger.info("[playbook] 过滤 %s: 对话过短（%d turns，无 assistant 回复）", fname, len(turns))
+                return None
+            logger.info("[playbook] 读取成功 %s: %d turns", fname, len(turns))
+            return {"filename": fname, "turns": turns}
 
-    # 并行读取所有文件
     results = await _asyncio.gather(*[_read_one(f) for f in jsonl_files], return_exceptions=True)
     conversations = []
+    read_fail = 0
+    skipped = 0
     for f, r in zip(jsonl_files, results):
         if isinstance(r, Exception):
-            _log.warning("[playbook] 读取 %s 失败: %s", f["name"], r)
+            read_fail += 1
+            logger.warning("[playbook] 读取异常 %s: %s", f["name"], r)
         elif r is not None:
             conversations.append(r)
+        else:
+            skipped += 1
 
-    return conversations
+    stats = {"total": len(jsonl_files), "valid": len(conversations),
+             "filtered": skipped, "failed": read_fail}
+    logger.info("[playbook] 读取完成: %d 个文件中 %d 个有效, %d 个过滤, %d 个失败",
+                stats["total"], stats["valid"], stats["filtered"], stats["failed"])
+
+    return conversations, stats
+
+
+_TOOL_INPUT_MAX = 120  # 工具调用参数预览最大字符数
+
+
+def _truncate(text: str, max_len: int) -> str:
+    """截断文本，超长时加省略号。"""
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + "…"
+
+
+def _summarize_tool_input(tool_name: str, raw_input: dict | str) -> str:
+    """将工具调用的 input 精简为简短摘要，避免大段文件内容占用 LLM 注意力。
+
+    对于读/写/编辑类工具，只保留路径和操作类型；
+    对于其他工具保留截断后的参数预览。
+    """
+    if isinstance(raw_input, str):
+        return _truncate(raw_input, _TOOL_INPUT_MAX)
+
+    if not isinstance(raw_input, dict):
+        return _truncate(str(raw_input), _TOOL_INPUT_MAX)
+
+    # 写文件 / 编辑文件类工具：只保留路径，截掉文件内容
+    path = raw_input.get("file_path") or raw_input.get("path") or raw_input.get("filename", "")
+    name_lower = tool_name.lower()
+
+    if any(kw in name_lower for kw in ("write", "edit", "create_file", "overwrite")):
+        if path:
+            return f"path={path}"
+        return _truncate(str(raw_input), _TOOL_INPUT_MAX)
+
+    if "read" in name_lower:
+        if path:
+            return f"path={path}"
+
+    if "bash" in name_lower or "execute" in name_lower:
+        cmd = raw_input.get("command", "")
+        if cmd:
+            return f"command={_truncate(cmd, _TOOL_INPUT_MAX)}"
+
+    if "search" in name_lower or "grep" in name_lower or "glob" in name_lower:
+        pattern = raw_input.get("pattern") or raw_input.get("query", "")
+        if pattern:
+            extra = f", path={path}" if path else ""
+            return f"pattern={_truncate(pattern, 80)}{extra}"
+
+    # 通用回退：截断整体字符串
+    return _truncate(str(raw_input), _TOOL_INPUT_MAX)
+
+
+# 非对话类型，应跳过
+_SKIP_TYPES = frozenset((
+    "system", "progress", "file-history-snapshot", "last-prompt",
+))
+
+# slash command 展开 prompt 的特征模式
+_RE_COMMAND_NAME = re.compile(r"<command-name>/?([^<]+)</command-name>")
+_RE_COMMAND_ARGS = re.compile(r"<command-args>(.*?)</command-args>", re.DOTALL)
+_EXPANDED_PROMPT_MARKERS = (
+    "IT IS CRITICAL THAT YOU FOLLOW THIS COMMAND",
+    "You must fully embody this agent",
+    "<agent-activation",
+)
+
+
+def _process_user_content(text: str) -> str | None:
+    """处理用户消息文本，识别并精简 slash command 展开内容。
+
+    返回处理后的文本，或 None 表示应跳过该消息。
+    """
+    stripped = text.strip()
+    if not stripped:
+        return None
+
+    # 跳过 IDE 注入的系统/命令消息（/exit, stdout 等）
+    if stripped.startswith("<") and (
+        "local-command-caveat" in stripped[:200]
+        or "local-command-stdout" in stripped[:200]
+    ):
+        return None
+
+    # 识别带 <command-name> 标签的 slash command
+    cmd_match = _RE_COMMAND_NAME.search(stripped)
+    if cmd_match:
+        cmd_name = cmd_match.group(1).strip()
+        # 提取参数
+        args_match = _RE_COMMAND_ARGS.search(stripped)
+        args = args_match.group(1).strip() if args_match else ""
+        if args:
+            return f"/{cmd_name} {args}"
+        return f"/{cmd_name}"
+
+    # 识别无标签的展开 prompt（slash command 的扩展内容）
+    for marker in _EXPANDED_PROMPT_MARKERS:
+        if marker in stripped[:200]:
+            # 检查是否有 ARGUMENTS: 部分（用户附带的真实参数）
+            args_idx = stripped.find("ARGUMENTS:")
+            if args_idx != -1:
+                user_args = stripped[args_idx + len("ARGUMENTS:"):].strip()
+                if user_args:
+                    return f"[自定义命令] {user_args}"
+            # 纯系统 prompt 展开，无用户参数 — 跳过
+            return None
+
+    return stripped
 
 
 def _extract_key_turns(jsonl_text: str) -> list[dict]:
-    """从 JSONL 提取关键对话片段（user 指令 / tool_use 名称 / assistant 回复）。
+    """从 JSONL 提取关键对话片段。
+
+    保留完整的用户指令和助手文字回复；工具调用只保留名称和精简参数摘要。
+    跳过非对话类型（system / progress / snapshot 等）和工具结果回传行。
 
     兼容两种 JSONL 格式：
     - 直接格式：{role: "human"/"assistant", content: ...}
@@ -476,6 +606,16 @@ def _extract_key_turns(jsonl_text: str) -> list[dict]:
         except (json.JSONDecodeError, ValueError):
             continue
 
+        top_type = record.get("type", "")
+
+        # 跳过非对话类型
+        if top_type in _SKIP_TYPES:
+            continue
+
+        # 跳过工具结果回传（嵌套格式中 type="user" + toolUseResult）
+        if "toolUseResult" in record:
+            continue
+
         # 兼容嵌套格式：从 message 字段提取 role/content
         role = record.get("role", "")
         content = record.get("content", "")
@@ -486,7 +626,6 @@ def _extract_key_turns(jsonl_text: str) -> list[dict]:
                 content = msg.get("content", "")
         # 也接受顶层 type 作为 role 的补充
         if not role:
-            top_type = record.get("type", "")
             if top_type in ("user", "human"):
                 role = "user"
             elif top_type == "assistant":
@@ -497,8 +636,10 @@ def _extract_key_turns(jsonl_text: str) -> list[dict]:
                 text_parts = [b.get("text", "") for b in content
                               if isinstance(b, dict) and b.get("type") == "text"]
                 content = " ".join(text_parts)
-            if isinstance(content, str) and content.strip():
-                turns.append({"role": "user", "text": content})
+            if isinstance(content, str):
+                processed = _process_user_content(content)
+                if processed:
+                    turns.append({"role": "user", "text": processed})
 
         elif role == "assistant":
             if isinstance(content, list):
@@ -506,10 +647,12 @@ def _extract_key_turns(jsonl_text: str) -> list[dict]:
                     if not isinstance(block, dict):
                         continue
                     if block.get("type") == "tool_use":
+                        tool_name = block.get("name", "?")
                         turns.append({
                             "role": "tool_use",
-                            "tool": block.get("name", "?"),
-                            "input_preview": str(block.get("input", {})),
+                            "tool": tool_name,
+                            "input_preview": _summarize_tool_input(
+                                tool_name, block.get("input", {})),
                         })
                     elif block.get("type") == "text" and block.get("text", "").strip():
                         turns.append({"role": "assistant", "text": block["text"]})
@@ -517,6 +660,33 @@ def _extract_key_turns(jsonl_text: str) -> list[dict]:
                 turns.append({"role": "assistant", "text": content})
 
     return turns
+
+
+async def list_machine_directory(client: AsyncHapiClient, machine_id: str,
+                                 path: str) -> list[dict]:
+    """通过 machine-level API 列出目录（不受 session 工作目录限制）"""
+    data = await client.get_json(f"/api/machines/{machine_id}/directory",
+                                 params={"path": path})
+    return data.get("entries", [])
+
+
+async def read_machine_file(client: AsyncHapiClient, machine_id: str,
+                            path: str, timeout: int = 120) -> tuple[bool, str]:
+    """通过 machine-level API 读取文件（不受 session 工作目录限制）"""
+    resp = await client.request("GET", f"/api/machines/{machine_id}/file",
+                                params={"path": path}, timeout=timeout)
+    if not resp.ok:
+        body = await resp.text()
+        resp.release()
+        return False, f"读取失败: {resp.status} {body[:200]}"
+    data = await resp.json()
+    resp.release()
+    if not data.get("success"):
+        return False, f"读取失败: {data.get('error', data.get('message', '未知错误'))}"
+    content = data.get("content", "")
+    if not content:
+        return False, "文件内容为空或不存在"
+    return True, content
 
 
 async def check_path_exists(client: AsyncHapiClient, machine_id: str, path: str) -> bool:

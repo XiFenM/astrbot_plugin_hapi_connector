@@ -136,7 +136,8 @@ class AsyncHapiClient:
         return {"Authorization": f"Bearer {token}"}
 
     async def request(self, method: str, path: str, *,
-                      retry_on_401: bool = True, **kwargs) -> aiohttp.ClientResponse:
+                      retry_on_401: bool = True, timeout: int | None = None,
+                      **kwargs) -> aiohttp.ClientResponse:
         """
         发送请求到 HAPI，自动附加 JWT。
         遇到 401 时自动刷新令牌并重试一次。
@@ -149,9 +150,11 @@ class AsyncHapiClient:
             headers.update(self._cf_mgr.get_headers())
         headers.update(await self._auth_headers())
 
+        req_timeout = aiohttp.ClientTimeout(total=timeout or 15)
+
         resp = await self._session.request(
             method, url, headers=headers,
-            timeout=aiohttp.ClientTimeout(total=15), **kwargs
+            timeout=req_timeout, **kwargs
         )
 
         if resp.status == 401 and retry_on_401:
@@ -161,7 +164,7 @@ class AsyncHapiClient:
             headers.update(await self._auth_headers())
             resp = await self._session.request(
                 method, url, headers=headers,
-                timeout=aiohttp.ClientTimeout(total=15), **kwargs
+                timeout=req_timeout, **kwargs
             )
 
         return resp

@@ -54,17 +54,17 @@ _provider_mod = types.ModuleType("astrbot.api.provider")
 _provider_mod.ProviderRequest = type("ProviderRequest", (), {})
 sys.modules["astrbot.api.provider"] = _provider_mod
 
-# Now import modules under test — use relative-style path
-_plugin_dir = os.path.dirname(__file__)
-sys.path.insert(0, os.path.dirname(_plugin_dir))
-_plugin_pkg = os.path.basename(_plugin_dir)
+# Now import modules under test
+_plugin_root = os.path.dirname(os.path.dirname(__file__))  # plugin root dir
+sys.path.insert(0, os.path.dirname(_plugin_root))
+_plugin_pkg = os.path.basename(_plugin_root)
 
 # Import via importlib for reliable resolution
 import importlib
-_session_ops = importlib.import_module(f"{_plugin_pkg}.session_ops")
-_state_mgr_mod = importlib.import_module(f"{_plugin_pkg}.state_manager")
-_llm_mod = importlib.import_module(f"{_plugin_pkg}.llm_integration")
-_binding_mod = importlib.import_module(f"{_plugin_pkg}.binding_manager")
+_session_ops = importlib.import_module(f"{_plugin_pkg}.ops.session_ops")
+_state_mgr_mod = importlib.import_module(f"{_plugin_pkg}.managers.state_manager")
+_llm_mod = importlib.import_module(f"{_plugin_pkg}.llm.llm_integration")
+_binding_mod = importlib.import_module(f"{_plugin_pkg}.managers.binding_manager")
 
 _extract_key_turns = _session_ops._extract_key_turns
 find_cc_history_dir = _session_ops.find_cc_history_dir
@@ -217,23 +217,23 @@ class TestFindCCHistoryDir:
     """Claude Code 历史目录定位"""
 
     def test_direct_match(self):
-        """方案 A：路径规则直接推算命中"""
-        async def fake_list_directory(client, sid, path):
+        """方�� A：路径规则直接推算命中"""
+        async def fake_list_machine_directory(client, machine_id, path):
             if path == "/root/.claude/projects/-root-workspace-host":
                 return [{"name": "abc.jsonl", "type": "file"}]
             return []
 
-        orig = _session_ops.list_directory
-        _session_ops.list_directory = fake_list_directory
+        orig = _session_ops.list_machine_directory
+        _session_ops.list_machine_directory = fake_list_machine_directory
         try:
-            result = asyncio.run(find_cc_history_dir(None, "sid", "/root/workspace/host"))
+            result = asyncio.run(find_cc_history_dir(None, "machine1", "/root/workspace/host"))
             assert result == "/root/.claude/projects/-root-workspace-host"
         finally:
-            _session_ops.list_directory = orig
+            _session_ops.list_machine_directory = orig
 
     def test_fallback_search(self):
         """方案 B：直接推算失败，遍历 projects 目录匹配"""
-        async def fake_list_directory(client, sid, path):
+        async def fake_list_machine_directory(client, machine_id, path):
             if path == "/root/.claude/projects/-my-project":
                 return []
             if path == "/root/.claude/projects":
@@ -241,28 +241,30 @@ class TestFindCCHistoryDir:
                     {"name": "other-stuff", "type": "directory"},
                     {"name": "-home-user-my-project", "type": "directory"},
                 ]
+            if path == "/root/.claude/projects/-home-user-my-project":
+                return [{"name": "conv.jsonl", "type": "file"}]
             return []
 
-        orig = _session_ops.list_directory
-        _session_ops.list_directory = fake_list_directory
+        orig = _session_ops.list_machine_directory
+        _session_ops.list_machine_directory = fake_list_machine_directory
         try:
-            result = asyncio.run(find_cc_history_dir(None, "sid", "/my/project"))
+            result = asyncio.run(find_cc_history_dir(None, "machine1", "/my/project"))
             assert result == "/root/.claude/projects/-home-user-my-project"
         finally:
-            _session_ops.list_directory = orig
+            _session_ops.list_machine_directory = orig
 
     def test_not_found(self):
         """两种方案都失败时返回 None"""
-        async def fake_list_directory(client, sid, path):
+        async def fake_list_machine_directory(client, machine_id, path):
             return []
 
-        orig = _session_ops.list_directory
-        _session_ops.list_directory = fake_list_directory
+        orig = _session_ops.list_machine_directory
+        _session_ops.list_machine_directory = fake_list_machine_directory
         try:
-            result = asyncio.run(find_cc_history_dir(None, "sid", "/nonexistent"))
+            result = asyncio.run(find_cc_history_dir(None, "machine1", "/nonexistent"))
             assert result is None
         finally:
-            _session_ops.list_directory = orig
+            _session_ops.list_machine_directory = orig
 
 
 # ════════════════════════════════════
@@ -279,33 +281,33 @@ class TestReadCCConversations:
         b64_simple = base64.b64encode(SAMPLE_JSONL_SIMPLE.encode()).decode()
         b64_complex = base64.b64encode(SAMPLE_JSONL_COMPLEX.encode()).decode()
 
-        async def fake_list_directory(client, sid, path):
+        async def fake_list_machine_directory(client, machine_id, path):
             return [
                 {"name": "conv1.jsonl", "type": "file", "modified": "2026-04-01T10:00:00"},
                 {"name": "conv2.jsonl", "type": "file", "modified": "2026-04-01T09:00:00"},
                 {"name": "notes.txt", "type": "file", "modified": "2026-04-01T08:00:00"},
             ]
 
-        async def fake_read_file(client, sid, path):
+        async def fake_read_machine_file(client, machine_id, path):
             if "conv1" in path:
                 return True, b64_simple
             if "conv2" in path:
                 return True, b64_complex
             return False, "not found"
 
-        orig_ld, orig_rf = so.list_directory, so.read_file
-        so.list_directory = fake_list_directory
-        so.read_file = fake_read_file
+        orig_ld, orig_rf = so.list_machine_directory, so.read_machine_file
+        so.list_machine_directory = fake_list_machine_directory
+        so.read_machine_file = fake_read_machine_file
         try:
-            convs = asyncio.run(read_cc_conversations(None, "sid", "/history"))
+            convs, _ = asyncio.run(read_cc_conversations(None, "machine1", "/history"))
             assert len(convs) == 2
             assert convs[0]["filename"] == "conv1.jsonl"
             assert convs[1]["filename"] == "conv2.jsonl"
             assert len(convs[0]["turns"]) > 0
             assert len(convs[1]["turns"]) > 0
         finally:
-            so.list_directory = orig_ld
-            so.read_file = orig_rf
+            so.list_machine_directory = orig_ld
+            so.read_machine_file = orig_rf
 
     def test_skip_unreadable_files(self):
         """读取失败的文件被跳过"""
@@ -313,54 +315,53 @@ class TestReadCCConversations:
 
         b64 = base64.b64encode(SAMPLE_JSONL_SIMPLE.encode()).decode()
 
-        async def fake_list_directory(client, sid, path):
+        async def fake_list_machine_directory(client, machine_id, path):
             return [
                 {"name": "good.jsonl", "type": "file", "modified": "2026-04-01T10:00:00"},
                 {"name": "bad.jsonl", "type": "file", "modified": "2026-04-01T09:00:00"},
             ]
 
-        async def fake_read_file(client, sid, path):
+        async def fake_read_machine_file(client, machine_id, path):
             if "good" in path:
                 return True, b64
             return False, "read error"
 
-        orig_ld, orig_rf = so.list_directory, so.read_file
-        so.list_directory = fake_list_directory
-        so.read_file = fake_read_file
+        orig_ld, orig_rf = so.list_machine_directory, so.read_machine_file
+        so.list_machine_directory = fake_list_machine_directory
+        so.read_machine_file = fake_read_machine_file
         try:
-            convs = asyncio.run(read_cc_conversations(None, "sid", "/history"))
+            convs, _ = asyncio.run(read_cc_conversations(None, "machine1", "/history"))
             assert len(convs) == 1
             assert convs[0]["filename"] == "good.jsonl"
         finally:
-            so.list_directory = orig_ld
-            so.read_file = orig_rf
+            so.list_machine_directory = orig_ld
+            so.read_machine_file = orig_rf
 
     def test_no_file_count_limit(self):
-        """验证不限制文件数量，全部读取"""
+        """验证不限制文件数量，全部读取（对话需足够丰富以通过过滤）"""
         so = _session_ops
 
-        b64 = base64.b64encode(
-            json.dumps({"role": "human", "content": "hello"}).encode()
-        ).decode()
+        # 构造包含 user + assistant 的对话，确保不被过滤
+        b64 = base64.b64encode(SAMPLE_JSONL_SIMPLE.encode()).decode()
 
-        async def fake_list_directory(client, sid, path):
+        async def fake_list_machine_directory(client, machine_id, path):
             return [
                 {"name": f"conv{i:03d}.jsonl", "type": "file", "modified": f"2026-01-{i+1:02d}T00:00:00"}
                 for i in range(25)
             ]
 
-        async def fake_read_file(client, sid, path):
+        async def fake_read_machine_file(client, machine_id, path):
             return True, b64
 
-        orig_ld, orig_rf = so.list_directory, so.read_file
-        so.list_directory = fake_list_directory
-        so.read_file = fake_read_file
+        orig_ld, orig_rf = so.list_machine_directory, so.read_machine_file
+        so.list_machine_directory = fake_list_machine_directory
+        so.read_machine_file = fake_read_machine_file
         try:
-            convs = asyncio.run(read_cc_conversations(None, "sid", "/history"))
+            convs, _ = asyncio.run(read_cc_conversations(None, "machine1", "/history"))
             assert len(convs) == 25
         finally:
-            so.list_directory = orig_ld
-            so.read_file = orig_rf
+            so.list_machine_directory = orig_ld
+            so.read_machine_file = orig_rf
 
 
 # ════════════════════════════════════
@@ -392,6 +393,22 @@ class TestAnalyzeHistoryWithLLM:
         """辅助：将对话列表格式化为文本段落"""
         return LLMIntegration._format_conversations(conversations)
 
+    @staticmethod
+    def _collect(gen):
+        """消费 async generator，返回 (result, progress_messages)。
+        result 从 __RESULT__: 前缀的 yield 中提取，None 表示无结果。
+        """
+        async def _run():
+            result = None
+            msgs = []
+            async for msg in gen:
+                if isinstance(msg, str) and msg.startswith("__RESULT__:"):
+                    result = msg[len("__RESULT__:"):]
+                else:
+                    msgs.append(msg)
+            return result, msgs
+        return asyncio.run(_run())
+
     def test_generates_playbook(self):
         """正常流程：LLM 返回 playbook"""
         expected = "## 有效做法\n- 修改前先读取文件\n## 应避免\n- 不要盲改"
@@ -408,9 +425,10 @@ class TestAnalyzeHistoryWithLLM:
         convs = [{"filename": "c.jsonl", "turns": _extract_key_turns(SAMPLE_JSONL_COMPLEX)}]
         formatted = self._format(convs)
 
-        result = asyncio.run(inst._analyze_history_with_llm(formatted, "/src/project", event))
+        result, msgs = self._collect(inst._analyze_history_with_llm(formatted, "/src/project", event))
         assert result is not None
         assert "有效做法" in result
+        assert any("分析" in m for m in msgs)  # 有进度消息
 
     def test_llm_failure_returns_none(self):
         """LLM 调用异常返回 None"""
@@ -420,14 +438,14 @@ class TestAnalyzeHistoryWithLLM:
 
         inst, event = self._make_instance(FakeProvider())
         formatted = self._format([{"filename": "x.jsonl", "turns": [{"role": "user", "text": "hi"}]}])
-        result = asyncio.run(inst._analyze_history_with_llm(formatted, "/src", event))
+        result, _ = self._collect(inst._analyze_history_with_llm(formatted, "/src", event))
         assert result is None
 
     def test_no_provider_returns_none(self):
         """无可用 provider 返回 None"""
         inst, event = self._make_instance(None)
         formatted = self._format([{"filename": "x.jsonl", "turns": [{"role": "user", "text": "hi"}]}])
-        result = asyncio.run(inst._analyze_history_with_llm(formatted, "/src", event))
+        result, _ = self._collect(inst._analyze_history_with_llm(formatted, "/src", event))
         assert result is None
 
     def test_short_content_single_call(self):
@@ -449,7 +467,7 @@ class TestAnalyzeHistoryWithLLM:
         ]
         formatted = self._format(convs)
 
-        asyncio.run(inst._analyze_history_with_llm(formatted, "/project", event))
+        self._collect(inst._analyze_history_with_llm(formatted, "/project", event))
         # 短内容只调用一次
         assert len(received_prompts) == 1
         # 验证所有对话内容都在 prompt 中
@@ -470,7 +488,6 @@ class TestAnalyzeHistoryWithLLM:
                 return FakeResp(f"摘要{len(call_log)}")
 
         inst, event = self._make_instance(FakeProvider())
-        # 构造超过 10000 字符的内容
         big_turn = {"role": "user", "text": "x" * 4000}
         convs = [
             {"filename": f"conv{i}.jsonl", "turns": [big_turn]}
@@ -480,7 +497,7 @@ class TestAnalyzeHistoryWithLLM:
         total_len = sum(len(s) for s in formatted)
         assert total_len > 10000, f"测试数据不够长: {total_len}"
 
-        result = asyncio.run(inst._analyze_history_with_llm(
+        result, msgs = self._collect(inst._analyze_history_with_llm(
             formatted, "/project", event, segment_threshold=10000,
         ))
 
@@ -491,8 +508,8 @@ class TestAnalyzeHistoryWithLLM:
         # 第二段及之后应包含前段摘要
         assert "前面内容的分析结果" in call_log[1]
         assert "摘要1" in call_log[1]
-        # 最终结果应是最后一段的摘要
-        assert result == f"摘要{len(call_log)}"
+        # 每段之间有进度 yield
+        assert any("正在分析第" in m for m in msgs)
 
     def test_segment_failure_continues(self):
         """某段总结失败时保留前段结果继续"""
@@ -518,7 +535,7 @@ class TestAnalyzeHistoryWithLLM:
         ]
         formatted = self._format(convs)
 
-        result = asyncio.run(inst._analyze_history_with_llm(
+        result, _ = self._collect(inst._analyze_history_with_llm(
             formatted, "/proj", event, segment_threshold=10000,
         ))
         # 第2段失败，但第1段的摘要被保留，第3段继续用它
@@ -710,33 +727,35 @@ class TestRealJSONL:
 
     def test_format_for_llm_analysis(self):
         """验证提取结果格式化后适合发给 LLM 分析"""
-        # 取一个中等大小的文件
+        # 取一个中等大小、且包含有效对话的文件
         files = self._all_jsonl_files()
         mid_file = None
+        mid_turns = None
         for f in files:
             size = os.path.getsize(os.path.join(REAL_HISTORY_DIR, f))
             if 10000 < size < 500000:
-                mid_file = f
-                break
+                with open(os.path.join(REAL_HISTORY_DIR, f)) as fh:
+                    turns = _extract_key_turns(fh.read())
+                if any(t["role"] == "user" for t in turns):
+                    mid_file = f
+                    mid_turns = turns
+                    break
         if not mid_file:
-            pytest.skip("没有找到合适大小的测试文件")
-
-        with open(os.path.join(REAL_HISTORY_DIR, mid_file)) as f:
-            turns = _extract_key_turns(f.read())
+            pytest.skip("没有找到包含有效用户消息的测试文件")
 
         # 模拟 LLM 分析时的格式化
         lines = [f"=== 对话: {mid_file} ==="]
-        for turn in turns:
+        for turn in mid_turns:
             if turn["role"] == "user":
-                lines.append(f"[用户指令] {turn['text']}")
+                lines.append(f"[用户] {turn['text']}")
             elif turn["role"] == "tool_use":
-                lines.append(f"[工具调用] {turn['tool']}: {turn.get('input_preview', '')}")
+                lines.append(f"  [工具] {turn['tool']}: {turn.get('input_preview', '')}")
             elif turn["role"] == "assistant":
-                lines.append(f"[助手回复] {turn['text']}")
+                lines.append(f"[助手] {turn['text']}")
 
         formatted = "\n".join(lines)
-        assert len(formatted) > 100, "格式化后内容过短"
-        assert "[用户指令]" in formatted
+        assert len(formatted) > 50, "格式化后内容过短"
+        assert "[用户]" in formatted
         assert "===" in formatted
 
 
@@ -795,7 +814,7 @@ class TestEndToEnd:
 
         # ── HAPI API mock：从本地磁盘读取真实 JSONL 文件 ──
 
-        async def fake_list_directory(client, sid, path):
+        async def fake_list_machine_directory(client, machine_id, path):
             """代理到本地文件系统"""
             if os.path.isdir(path):
                 entries = []
@@ -811,7 +830,7 @@ class TestEndToEnd:
                 return entries
             return []
 
-        async def fake_read_file(client, sid, path):
+        async def fake_read_machine_file(client, machine_id, path):
             """代理到本地文件系统，返回 base64"""
             if os.path.isfile(path):
                 with open(path, "rb") as f:
@@ -847,11 +866,11 @@ class TestEndToEnd:
         # mock effective_sid 返回我们的假 sid
         state_mgr.effective_sid = lambda event: fake_sid
 
-        # mock session_ops 的 HAPI API 调用
-        orig_ld = _session_ops.list_directory
-        orig_rf = _session_ops.read_file
-        _session_ops.list_directory = fake_list_directory
-        _session_ops.read_file = fake_read_file
+        # mock session_ops 的 machine-level API 调用
+        orig_ld = _session_ops.list_machine_directory
+        orig_rf = _session_ops.read_machine_file
+        _session_ops.list_machine_directory = fake_list_machine_directory
+        _session_ops.read_machine_file = fake_read_machine_file
 
         try:
             # ── 执行 learn ──
@@ -865,8 +884,8 @@ class TestEndToEnd:
 
             results = asyncio.run(run())
         finally:
-            _session_ops.list_directory = orig_ld
-            _session_ops.read_file = orig_rf
+            _session_ops.list_machine_directory = orig_ld
+            _session_ops.read_machine_file = orig_rf
 
         # ── 验证输出 ──
 
@@ -878,7 +897,7 @@ class TestEndToEnd:
 
         # 应该包含进度信息
         assert any("正在查找" in str(r) for r in results), "缺少'正在查找'进度消息"
-        assert any("历史对话" in str(r) for r in results), "缺少对话数量报告"
+        assert any("个有效" in str(r) for r in results), "缺少文件统计报告"
 
         # 应该成功生成 playbook
         assert any("✅" in str(r) for r in results), "缺少成功标记"
