@@ -547,12 +547,24 @@ quick_prefix (快捷前缀): {quick_prefix}
         # 1. 先用原 session 尝试（如果 work_dir 恰好能访问 .claude/projects 则直接成功）
         # 2. 找不到历史时，创建工作目录为 / 的临时 session（可访问所有路径）重试
         machine_id = session.get("machineId", "")
+        # sessions_cache 的列表接口可能不含 machineId，尝试从详情补全
+        if not machine_id:
+            try:
+                detail = await session_ops.fetch_session_detail(self.client, sid)
+                machine_id = detail.get("machineId", "")
+            except Exception as e:
+                logger.debug("[playbook] 获取 session 详情失败: %s", e)
         file_sid = sid
         temp_sid: str | None = None
+        logger.debug("[playbook] session=%s machine_id=%r work_dir=%r", sid[:8], machine_id, work_dir)
 
         try:
             # 第一次尝试：用原 session
             history_dir = await session_ops.find_cc_history_dir(self.client, file_sid, work_dir)
+
+            if not history_dir and not machine_id:
+                yield "⚠️ 该 session 没有 machineId，无法创建临时会话访问历史目录"
+                return
 
             if not history_dir and machine_id:
                 # .claude/projects 通常是 work_dir 的兄弟路径，原 session 无法访问
