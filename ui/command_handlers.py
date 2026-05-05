@@ -1,6 +1,8 @@
 """命令处理器 - 处理所有 /hapi 子命令
 """
 
+import difflib
+
 from astrbot.api.event import AstrMessageEvent
 from astrbot.core.utils.session_waiter import session_waiter, SessionController
 from . import formatters
@@ -1515,7 +1517,7 @@ class CommandHandlers:
                                   f"💡 如需修改，发送：/hapi playbook refine <你的意见>")
 
     async def _playbook_refine(self, event: AstrMessageEvent, session_target: str, feedback: str):
-        """根据用户反馈修改 playbook"""
+        """根据用户反馈修改 playbook，展示 diff 后等待确认再保存"""
         pb_key, display_name, work_dir = self.plugin.llm_integration.resolve_playbook_key(event, session_target)
         if not pb_key:
             if session_target:
@@ -1540,10 +1542,64 @@ class CommandHandlers:
             yield event.plain_result("❌ LLM 修改失败，请稍后重试")
             return
 
-        self.state_mgr.set_playbook(pb_key, refined)
-        await self.state_mgr.persist_playbook(pb_key)
+        # 生成 diff 摘要
+        diff_text = self._format_playbook_diff(current, refined)
 
-        yield event.plain_result(f"✅ [{display_name}] 的 Playbook 已更新！\n\n{refined}")
+        if not diff_text:
+            yield event.plain_result("ℹ️ LLM 未对 Playbook 做出任何修改")
+            return
+
+        # 展示 diff，等待用户确认
+        confirm_msg = (
+            f"📝 [{display_name}] Playbook 修改预览：\n\n"
+            f"{diff_text}\n\n"
+            f"回复 y 确认保存，回复 n 或其他内容取消"
+        )
+        yield event.plain_result(confirm_msg)
+
+        saved = False
+
+        @session_waiter(timeout=60, record_history_chains=False)
+        async def confirm_waiter(controller: SessionController, ev: AstrMessageEvent):
+            nonlocal saved
+            reply = ev.message_str.strip().lower()
+            if not reply:
+                controller.keep(timeout=60, reset_timeout=True)
+                return
+            if reply in ("y", "yes", "是", "确认", "ok"):
+                self.state_mgr.set_playbook(pb_key, refined)
+                await self.state_mgr.persist_playbook(pb_key)
+                saved = True
+                await ev.send(ev.plain_result(f"✅ [{display_name}] 的 Playbook 已保存"))
+            else:
+                await ev.send(ev.plain_result("↩️ 已取消，Playbook 保持原样"))
+            controller.stop()
+
+        try:
+            await confirm_waiter(event)
+        except TimeoutError:
+            yield event.plain_result("⏰ 等待超时（60s），已取消，Playbook 保持原样")
+        finally:
+            event.stop_event()
+
+    @staticmethod
+    def _format_playbook_diff(old: str, new: str) -> str:
+        """生成简洁易读的 diff 摘要，只显示变更行"""
+        old_lines = old.splitlines()
+        new_lines = new.splitlines()
+        diff = list(difflib.unified_diff(old_lines, new_lines, lineterm="", n=0))
+        if not diff:
+            return ""
+
+        parts = []
+        for line in diff[2:]:  # 跳过 --- +++ 文件头
+            if line.startswith("@@"):
+                parts.append("···")
+            elif line.startswith("+"):
+                parts.append(f"➕ {line[1:]}")
+            elif line.startswith("-"):
+                parts.append(f"➖ {line[1:]}")
+        return "\n".join(parts)
 
     # ── reset ──
 
