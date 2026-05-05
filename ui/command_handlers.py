@@ -1128,7 +1128,7 @@ class CommandHandlers:
 
     async def cmd_files(self, event: AstrMessageEvent, path: str = "."):
         """浏览远端目录: /hapi files [-l] [路径]"""
-        from . import file_ops
+        from ..ops import file_ops
         await self.state_mgr.set_user_state(event)
         if w := self.plugin._conn_warning():
             yield event.plain_result(w)
@@ -1179,7 +1179,7 @@ class CommandHandlers:
         """下载远端文件到聊天: /hapi download <路径>"""
         import os
         import astrbot.api.message_components as Comp
-        from . import file_ops
+        from ..ops import file_ops
         await self.state_mgr.set_user_state(event)
         if w := self.plugin._conn_warning():
             yield event.plain_result(w)
@@ -1225,7 +1225,7 @@ class CommandHandlers:
 
     async def cmd_upload(self, event: AstrMessageEvent, action: str = ""):
         """上传文件到当前 session: /hapi upload [cancel]"""
-        from . import file_ops
+        from ..ops import file_ops
         await self.state_mgr.ensure_primary_session(event)
         sid = self.state_mgr.effective_sid(event)
         if not sid:
