@@ -547,13 +547,21 @@ quick_prefix (快捷前缀): {quick_prefix}
         file_sid = sid  # 默认用原 session
         temp_sid: str | None = None  # 临时 session，用完归档
 
-        # 先用原 session 探测文件系统是否可访问
+        # 探测是否能访问 ~/.claude/projects/（而非 /root）
+        # HAPI 目录 API 只允许访问 session work_dir 的祖先路径 + 子路径，
+        # .claude/projects 通常是 work_dir 的兄弟路径，无法直接访问
+        from ..ops.session_ops import _guess_home_dir
+        home_dir = _guess_home_dir(work_dir)
+        projects_base = f"{home_dir}/.claude/projects"
+        can_access_projects = False
         try:
-            probe = await session_ops.list_directory(self.client, file_sid, "/root")
+            await session_ops.list_directory(self.client, file_sid, projects_base)
+            can_access_projects = True
         except Exception:
-            probe = []
+            can_access_projects = False
+        logger.debug("[playbook] 探测 %s 可访问=%s (sid=%s)", projects_base, can_access_projects, file_sid[:8])
 
-        if not probe and machine_id:
+        if not can_access_projects and machine_id:
             # 原 session 不可用，在目标机器的 / 创建临时 session
             logger.info("[playbook] 原 session 文件系统不可访问，创建临时 session...")
             yield "🔄 正在创建临时会话以访问文件系统..."
