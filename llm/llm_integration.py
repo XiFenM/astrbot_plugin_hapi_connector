@@ -1277,7 +1277,7 @@ quick_prefix (快捷前缀): {quick_prefix}
         yield mgr.format_plan_status(plan)
 
     async def tool_takeover_control(self, event: AstrMessageEvent, action: str):
-        """控制 takeover 执行：start / pause / resume / cancel"""
+        """控制 takeover 执行：start / pause / resume / skip / accept / cancel"""
         mgr = getattr(self.plugin, 'takeover_mgr', None)
         if not mgr:
             yield "当前未启用 takeover 模式。"
@@ -1287,10 +1287,10 @@ quick_prefix (快捷前缀): {quick_prefix}
             yield self._missing_session_text()
             return
 
-        # start 需要审批（开始执行是重大操作）
-        if action == "start":
+        # start / cancel 需要审批（重大操作）
+        if action in ("start", "cancel"):
             approved, reason = await self._require_approval(
-                "hapi_coding_takeover_control", {"action": "start"}, event)
+                "hapi_coding_takeover_control", {"action": action}, event)
             if not approved:
                 if reason == "timeout":
                     yield "操作已超时取消。"
@@ -1300,6 +1300,19 @@ quick_prefix (快捷前缀): {quick_prefix}
 
         result = await mgr.control(sid, action)
         yield result
+
+    async def tool_takeover_check(self, event: AstrMessageEvent):
+        """诊断当前 takeover 状态（LLM 工具版，输出结构化文本给 LLM 解析）。"""
+        mgr = getattr(self.plugin, 'takeover_mgr', None)
+        if not mgr:
+            yield "当前未启用 takeover 模式。"
+            return
+        sid = self._effective_sid(event)
+        if not sid:
+            yield self._missing_session_text()
+            return
+        text = await mgr.check_for_llm(sid)
+        yield text
 
     async def tool_stop_message(self, event: AstrMessageEvent):
         '''停止当前 session 的消息生成。'''

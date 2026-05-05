@@ -72,6 +72,8 @@ class SSEListener:
         # F7: SSE 断连通知状态
         self._disconnect_notified: bool = False
         self._disconnect_notify_task: asyncio.Task | None = None
+        # 超时清理 sweep 后台 task
+        self._sweep_task: asyncio.Task | None = None
 
     def start(self, output_level: str = "summary", remind_pending: bool = False, remind_interval: int = 180,
               auto_approve_enabled: bool = False, auto_approve_start: str = "23:00", auto_approve_end: str = "07:00",
@@ -102,6 +104,8 @@ class SSEListener:
             logger.info("SSE 监听已在运行，跳过重复启动")
             return
         self._task = asyncio.create_task(self._listen_loop())
+        if self._sweep_task is None or self._sweep_task.done():
+            self._sweep_task = asyncio.create_task(self._stale_completion_sweep())
 
     async def stop(self):
         """停止 SSE 监听"""
@@ -110,7 +114,8 @@ class SSEListener:
                      getattr(self, '_completion_task', None),
                      getattr(self, '_compact_check_task', None),
                      getattr(self, '_request_notify_task', None),
-                     getattr(self, '_disconnect_notify_task', None)):
+                     getattr(self, '_disconnect_notify_task', None),
+                     getattr(self, '_sweep_task', None)):
             if task and not task.done():
                 task.cancel()
                 try:
@@ -120,6 +125,7 @@ class SSEListener:
         self._task = None
         self._remind_task = None
         self._request_notify_task = None
+        self._sweep_task = None
         self._queued_request_notifications = {}
         self._request_notify_sids.clear()
 
@@ -154,6 +160,85 @@ class SSEListener:
                 await self._push_notification("⚠️ SSE 连接已断开，正在自动重连...", "")
         except asyncio.CancelledError:
             pass
+
+    async def _stale_completion_sweep(self):
+        """每 60s 跑一次。三件事：
+          1. takeover ctx 超过 30 min → 暂停计划 + 通知用户
+          2. paused 计划 awaiting_response_since 超过 5 min → 通知 AI 接管
+          3. _pending_llm_completions 超过 10 min → 直接 pop + 通知用户
+        """
+        cfg = getattr(self._plugin, "config", {}) or {}
+
+        while True:
+            try:
+                await asyncio.sleep(60)
+
+                # 阶段一：takeover ctx 超时
+                now_mono = time.monotonic()
+                timeout_tk = int(cfg.get("takeover_completion_timeout", 1800))
+                for sid in list(self._pending_takeover_completions):
+                    ctx = self._pending_takeover_completions.get(sid)
+                    if ctx and now_mono - ctx["ts"] > timeout_tk:
+                        try:
+                            await self._handle_stale_takeover(sid, ctx)
+                        except Exception as e:
+                            logger.warning("[sweep] takeover handler 异常 sid=%s: %s",
+                                           sid[:8], e)
+
+                # 阶段二：用户响应超时（wall clock，重启后继续生效）
+                now_wall = time.time()
+                response_grace = int(cfg.get("user_response_timeout", 300))
+                if self._takeover_mgr is not None:
+                    for sid, plan in list(self._takeover_mgr._plans.items()):
+                        awaiting = plan.get("awaiting_response_since")
+                        if awaiting and now_wall - awaiting > response_grace:
+                            try:
+                                await self._takeover_mgr.on_user_response_timeout(sid)
+                            except Exception as e:
+                                logger.warning("[sweep] user_response handler 异常 sid=%s: %s",
+                                               sid[:8], e)
+
+                # 阶段三：tool_send_message 完成回调超时
+                timeout_llm = int(cfg.get("pending_message_timeout", 600))
+                for sid in list(self._pending_llm_completions):
+                    ctx = self._pending_llm_completions.get(sid)
+                    if ctx and now_mono - ctx["ts"] > timeout_llm:
+                        try:
+                            await self._handle_stale_llm(sid, ctx)
+                        except Exception as e:
+                            logger.warning("[sweep] llm handler 异常 sid=%s: %s",
+                                           sid[:8], e)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("[sweep] 主循环异常: %s", e)
+
+    async def _handle_stale_takeover(self, sid: str, ctx: dict):
+        """超时清理（薄壳）：仅 pop ctx + 委托 takeover_mgr 落地暂停。"""
+        self._pending_takeover_completions.pop(sid, None)
+        age = time.monotonic() - ctx["ts"]
+        logger.warning("[sweep] takeover stale sid=%s task=%s age=%.0fs",
+                       sid[:8], ctx.get("task_id"), age)
+        if self._takeover_mgr is not None:
+            await self._takeover_mgr.on_sweep_timeout(sid, ctx.get("task_id", ""))
+
+    async def _handle_stale_llm(self, sid: str, ctx: dict):
+        """tool_send_message 完成回调超时：pop + 通知用户。"""
+        self._pending_llm_completions.pop(sid, None)
+        age = time.monotonic() - ctx["ts"]
+        logger.warning("[sweep] llm completion timeout sid=%s age=%.0fs",
+                       sid[:8], age)
+        try:
+            targets = self._plugin.state_mgr.select_notification_targets(
+                sid, self.sessions_cache)
+            umo = targets[0] if targets else None
+            if umo:
+                await self._send_user_message(
+                    umo,
+                    "⚠️ 之前提交给 Claude Code 的任务超过 10 分钟未收到完成通知，"
+                    "已停止等待 LLM 自动总结。如需查看结果请用 /hapi msg。")
+        except Exception as e:
+            logger.warning("[sweep] llm 通知失败 sid=%s: %s", sid[:8], e)
 
     async def _listen_loop(self):
         """主循环：SSE 监听 + 指数退避重连"""
@@ -632,7 +717,9 @@ class SSEListener:
                         try:
                             response = await self._plugin.llm_integration._fetch_completion_response(
                                 sid, takeover_ctx["pre_send_seq"])
-                            await self._takeover_mgr.on_task_completed(sid, response)
+                            await self._takeover_mgr.on_task_completed(
+                                sid, response,
+                                ctx_task_id=takeover_ctx.get("task_id"))
                         except Exception as e:
                             logger.warning("[takeover] completion error: %s (sid=%s)", e, sid[:8])
                         self._completion_notified_seqs[sid] = last_seq

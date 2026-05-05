@@ -121,6 +121,24 @@
     "default": 20,
     "hint": "任务总数上限，防止计划过于庞大"
   },
+  "takeover_completion_timeout": {
+    "description": "Takeover 单任务完成回调超时秒数（超时后 sweep 会暂停计划并通知用户）",
+    "type": "int",
+    "default": 1800,
+    "hint": "默认 30 分钟。如果单任务经常需要更长时间（如大型重构），可调高至 3600。"
+  },
+  "user_response_timeout": {
+    "description": "Takeover 计划被 sweep 暂停后，用户响应窗口秒数（超过则通知 AI 接管）",
+    "type": "int",
+    "default": 300,
+    "hint": "默认 5 分钟。设小则更快交给 AI 处理，设大则给用户更多手动响应时间。"
+  },
+  "pending_message_timeout": {
+    "description": "tool_send_message 等待 Claude Code 完成回应的超时秒数（超时后 sweep 会通知用户）",
+    "type": "int",
+    "default": 600,
+    "hint": "默认 10 分钟。仅影响 LLM 自动总结的等待，不影响 takeover 模式。"
+  },
   "default_notification_window": {
     "description": "默认通知发送窗口",
     "type": "string",

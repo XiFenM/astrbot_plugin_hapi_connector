@@ -156,6 +156,12 @@ class TakeoverManager:
     def get_plan(self, sid: str) -> dict | None:
         return self._plans.get(sid)
 
+    def lookup_task(self, sid: str, task_id: str) -> dict | None:
+        plan = self._plans.get(sid)
+        if not plan:
+            return None
+        return _find_task_by_id(plan["tasks"], task_id)
+
     def format_plan_status(self, plan: dict) -> str:
         return _format_plan_text(plan, with_status=True)
 
@@ -240,7 +246,7 @@ class TakeoverManager:
     # ════════════════════════════════════════
 
     async def control(self, sid: str, action: str) -> str:
-        """统一控制入口：start / pause / resume / cancel"""
+        """统一控制入口：start / pause / resume / skip / accept / cancel"""
         plan = self._plans.get(sid)
         if not plan:
             return "❌ 当前无活跃计划"
@@ -251,15 +257,21 @@ class TakeoverManager:
             return await self._pause(sid, plan)
         elif action == "resume":
             return await self._resume(sid, plan)
+        elif action == "skip":
+            return await self._skip(sid, plan)
+        elif action == "accept":
+            return await self._accept(sid, plan)
         elif action == "cancel":
             return await self._cancel(sid, plan)
         else:
-            return f"❌ 未知操作: {action}，可用: start / pause / resume / cancel"
+            return (f"❌ 未知操作: {action}，"
+                    "可用: start / pause / resume / skip / accept / cancel")
 
     async def _start(self, sid: str, plan: dict) -> str:
         if plan["status"] != "confirming":
             return f"❌ 计划状态为 {plan['status']}，只有 confirming 状态可以开始"
         plan["status"] = "executing"
+        plan["awaiting_response_since"] = None
         plan["updated_at"] = time.time()
         await self._persist(sid)
         logger.info("[takeover] starting plan for sid=%s, tasks=%d", sid[:8], len(plan["tasks"]))
@@ -272,6 +284,7 @@ class TakeoverManager:
         if plan["status"] != "executing":
             return f"❌ 计划状态为 {plan['status']}，只有 executing 状态可以暂停"
         plan["status"] = "paused"
+        plan["awaiting_response_since"] = None
         plan["updated_at"] = time.time()
         await self._persist(sid)
         logger.info("[takeover] paused plan for sid=%s", sid[:8])
@@ -281,6 +294,7 @@ class TakeoverManager:
         if plan["status"] != "paused":
             return f"❌ 计划状态为 {plan['status']}，只有 paused 状态可以恢复"
         plan["status"] = "executing"
+        plan["awaiting_response_since"] = None
         plan["updated_at"] = time.time()
         await self._persist(sid)
         logger.info("[takeover] resuming plan for sid=%s", sid[:8])
@@ -294,11 +308,307 @@ class TakeoverManager:
     async def _cancel(self, sid: str, plan: dict) -> str:
         if plan["status"] in ("completed", "cancelled"):
             return f"计划已是 {plan['status']} 状态"
+
+        # 通知 HAPI 终止当前任务
+        abort_ok, abort_msg = await session_ops.abort_session(self.client, sid)
+
+        # 清掉本地 pending ctx，防止迟到的 completion 触发评估
+        sse = self.plugin.sse_listener
+        sse._pending_takeover_completions.pop(sid, None)
+
         plan["status"] = "cancelled"
+        plan["awaiting_response_since"] = None
         plan["updated_at"] = time.time()
         await self._persist(sid)
-        logger.info("[takeover] cancelled plan for sid=%s", sid[:8])
-        return "🛑 计划已取消。当前运行中的 HAPI 任务不会被中断。"
+        logger.info("[takeover] cancelled sid=%s hapi_abort=%s", sid[:8], abort_ok)
+
+        if abort_ok:
+            return "🛑 计划已取消，HAPI 端任务已中止。"
+        else:
+            return (f"🛑 计划已在本地取消，但 HAPI 中止失败：{abort_msg}\n"
+                    "如有需要请用 /hapi stop 手动中止。")
+
+    async def _skip(self, sid: str, plan: dict) -> str:
+        """跳过当前任务，推进到下一个。"""
+        if plan["status"] not in ("paused", "executing"):
+            return f"❌ 计划状态为 {plan['status']}，只有 paused / executing 可以 skip"
+
+        task_id = plan.get("current_task_id")
+        task = _find_task_by_id(plan["tasks"], task_id) if task_id else None
+        if not task:
+            return "❌ 当前没有可跳过的任务"
+
+        plan["awaiting_response_since"] = None
+        if task["status"] == "done":
+            # 任务已完成（pause 时刚好完成但未推进），等价于 resume
+            plan["status"] = "executing"
+            plan["updated_at"] = time.time()
+            await self._persist(sid)
+            asyncio.create_task(self._execute_next_task(sid))
+            return "ℹ️ 当前任务已完成，直接推进下一个。"
+
+        task["status"] = "skipped"
+        task["result_summary"] = task.get("result_summary") or "用户/AI 手动跳过"
+        plan["status"] = "executing"
+        plan["updated_at"] = time.time()
+        await self._persist(sid)
+        logger.info("[takeover] skip sid=%s task=%s", sid[:8], task_id)
+        asyncio.create_task(self._execute_next_task(sid))
+        return f"⏭️ 已跳过任务「{task['title']}」，继续下一个。"
+
+    async def _accept(self, sid: str, plan: dict) -> str:
+        """把 HAPI 当前回应当作任务结果，走 on_task_completed 推进。"""
+        if plan["status"] != "paused":
+            return f"❌ 计划状态为 {plan['status']}，只有 paused 可以 accept"
+
+        task_id = plan.get("current_task_id")
+        task = _find_task_by_id(plan["tasks"], task_id) if task_id else None
+        if not task:
+            return "❌ 当前没有可 accept 的任务"
+        if task["status"] not in ("pending", "running"):
+            return f"❌ 任务状态为 {task['status']}，accept 只对 pending / running 任务有效"
+
+        pre_send_seq = task.get("pre_send_seq")
+        if pre_send_seq is None:
+            return "❌ 找不到该任务的发送记录，无法 accept；建议 resume 重做。"
+
+        # 拉响应
+        try:
+            response = await self.plugin.llm_integration._fetch_completion_response(
+                sid, pre_send_seq)
+        except Exception as e:
+            logger.warning("[takeover] accept fetch_response 失败 sid=%s: %s", sid[:8], e)
+            return f"❌ 拉取 HAPI 响应失败：{e}\n建议 resume 或 skip。"
+
+        if not response or len(response.strip()) < 50:
+            return ("❌ HAPI 没有返回足够内容（< 50 字符），无法 accept。\n"
+                    "建议 check 后选择 resume 或 skip。")
+
+        plan["awaiting_response_since"] = None
+        plan["status"] = "executing"
+        task["status"] = "running"  # on_task_completed 期望 running
+        await self._persist(sid)
+        logger.info("[takeover] accept sid=%s task=%s response_len=%d",
+                    sid[:8], task_id, len(response))
+        # 走标准评估路径推进（异步执行避免阻塞返回）
+        asyncio.create_task(
+            self.on_task_completed(sid, response, ctx_task_id=task_id))
+        return "✅ 已采纳 HAPI 当前回应作为任务结果，正在评估并推进。"
+
+    # ════════════════════════════════════════
+    # 诊断（check —— 用户与 AI 共享的核心）
+    # ════════════════════════════════════════
+
+    async def check(self, sid: str) -> dict:
+        """诊断当前 takeover 状态。返回 CheckResult dict。
+
+        必须用实时 API 调用而非内存缓存：超时场景下本地缓存大概率也已落后。
+
+        返回字段：
+          ok: bool                — 检查是否成功（API 可达）
+          reason: str             — ok=False 时的原因（"no_plan" / "hapi_unreachable"）
+          plan, task: dict        — 当前 plan 和 task
+          thinking, active: bool  — HAPI 实时状态
+          has_output: bool        — 响应是否 ≥ 50 字符
+          response_preview: str   — 响应文本前 500 字符
+          recommendation: str     — "wait" / "accept" / "manual"
+        """
+        plan = self._plans.get(sid)
+        if not plan:
+            return {"ok": False, "reason": "no_plan"}
+
+        task_id = plan.get("current_task_id")
+        task = _find_task_by_id(plan["tasks"], task_id) if task_id else None
+
+        # 调 HAPI REST API 拿 fresh 状态
+        try:
+            detail = await session_ops.fetch_session_detail(self.client, sid)
+        except Exception as e:
+            return {
+                "ok": False,
+                "reason": "hapi_unreachable",
+                "error": str(e),
+                "plan": plan,
+                "task": task,
+            }
+
+        thinking = bool(detail.get("thinking", False))
+        active = bool(detail.get("active", False))
+
+        # 拉响应（pre_send_seq 来自 task，sweep 后仍保留）
+        response = ""
+        if task and task.get("pre_send_seq") is not None:
+            try:
+                response = await self.plugin.llm_integration._fetch_completion_response(
+                    sid, task["pre_send_seq"])
+            except Exception as e:
+                logger.warning("[check] fetch_response 失败 sid=%s: %s", sid[:8], e)
+
+        has_output = bool(response and len(response.strip()) >= 50)
+
+        if thinking or active:
+            recommendation = "wait"
+        elif has_output:
+            recommendation = "accept"
+        else:
+            recommendation = "manual"
+
+        return {
+            "ok": True,
+            "plan": plan,
+            "task": task,
+            "thinking": thinking,
+            "active": active,
+            "has_output": has_output,
+            "response_preview": response[:500] if response else "",
+            "recommendation": recommendation,
+        }
+
+    async def check_for_user(self, sid: str) -> str:
+        """用户命令 /hapi takeover check 入口：调 check 核心 + 用户文案 + 清 awaiting。"""
+        result = await self.check(sid)
+        await self._clear_awaiting_response_since(sid)
+        return self._format_check_result_for_user(result)
+
+    async def check_for_llm(self, sid: str) -> str:
+        """LLM 工具 hapi_coding_takeover_check 入口：调 check 核心 + LLM 文案 + 清 awaiting。"""
+        result = await self.check(sid)
+        await self._clear_awaiting_response_since(sid)
+        return self._format_check_result_for_llm(result)
+
+    async def _clear_awaiting_response_since(self, sid: str):
+        plan = self._plans.get(sid)
+        if plan and plan.get("awaiting_response_since"):
+            plan["awaiting_response_since"] = None
+            await self._persist(sid)
+
+    def _format_check_result_for_user(self, result: dict) -> str:
+        if not result["ok"]:
+            if result["reason"] == "no_plan":
+                return "当前 session 无 takeover 计划。"
+            if result["reason"] == "hapi_unreachable":
+                return (f"❌ 无法访问 HAPI：{result.get('error', '')}\n"
+                        "可能 HAPI 服务下线或网络异常，建议人工检查。")
+            return f"❌ 诊断失败：{result.get('reason')}"
+
+        plan = result["plan"]
+        task = result["task"]
+        title = task["title"] if task else "（无当前任务）"
+        plan_text = _format_plan_text(plan, with_status=True)
+
+        state_line = "🟢 thinking" if result["thinking"] else (
+            "🟢 active（执行工具）" if result["active"] else "⚪ idle")
+
+        rec_text = {
+            "wait": "建议再等等（HAPI 仍在工作）；可调 resume 让 takeover 重新等待。",
+            "accept": "建议 accept（HAPI 看起来已完成）；如有疑虑可手动检查 /hapi msg。",
+            "manual": "建议人工判断（HAPI 空闲但无输出，可能已被中止/出错）。",
+        }.get(result["recommendation"], "")
+
+        preview = result.get("response_preview", "")
+        preview_block = ""
+        if preview:
+            head = preview[:200].replace("\n", " ")
+            preview_block = f"\n\n📝 HAPI 响应预览（前 200 字）：\n> {head}"
+
+        return (f"=== Takeover 诊断 ===\n{plan_text}\n\n"
+                f"=== HAPI 当前情况 ===\n"
+                f"当前任务: {title}\n"
+                f"HAPI 状态: {state_line}\n"
+                f"有有效输出: {'是' if result['has_output'] else '否'}"
+                f"{preview_block}\n\n"
+                f"=== 推荐 ===\n{rec_text}\n\n"
+                f"可选: /hapi takeover [resume|accept|skip|cancel]")
+
+    def _format_check_result_for_llm(self, result: dict) -> str:
+        if not result["ok"]:
+            return (f"check_failed reason={result['reason']} "
+                    f"error={result.get('error', '')}")
+
+        plan = result["plan"]
+        task = result["task"]
+        title = task["title"] if task else "(none)"
+        return (
+            f"plan_status={plan['status']} "
+            f"task_title={title!r} "
+            f"hapi_thinking={result['thinking']} "
+            f"hapi_active={result['active']} "
+            f"has_output={result['has_output']} "
+            f"recommendation={result['recommendation']}\n"
+            f"response_preview: {result.get('response_preview', '')[:300]}")
+
+    # ════════════════════════════════════════
+    # Sweep 超时回调（由 sse_listener 周期调用）
+    # ════════════════════════════════════════
+
+    async def on_sweep_timeout(self, sid: str, task_id: str):
+        """单任务超过 30 min 未完成，安全暂停并启动 5min 用户响应窗口。"""
+        plan = self._plans.get(sid)
+        if not plan or plan["status"] != "executing":
+            return  # 已 cancel / completed / paused，不动
+        task = _find_task_by_id(plan["tasks"], task_id) if task_id else None
+        if task and task["status"] == "running":
+            task["status"] = "pending"  # 回滚，让 resume 可重做
+        plan["status"] = "paused"
+        plan["awaiting_response_since"] = time.time()  # 启动 5min 计时
+        plan["updated_at"] = time.time()
+        await self._persist(sid)
+
+        title = task["title"] if task else "未知任务"
+        logger.warning("[takeover] sweep timeout sid=%s task=%s title=%r",
+                       sid[:8], task_id, title)
+        await self._notify_user(
+            sid,
+            f"⚠️ 任务「{title}」超过 30 分钟未完成，计划已自动暂停。\n"
+            f"\n"
+            f"建议先用 /hapi takeover check 诊断 HAPI 当前状态，\n"
+            f"然后选择处理方式（accept / resume / skip / cancel）。\n"
+            f"\n"
+            f"5 分钟内未响应将自动通知 AstrBot AI 接管处理。")
+
+    async def on_user_response_timeout(self, sid: str):
+        """暂停后 5 分钟用户未响应，通知 AI 接管。"""
+        plan = self._plans.get(sid)
+        if not plan or not plan.get("awaiting_response_since"):
+            return  # 已被用户/前一轮清掉
+        if plan["status"] != "paused":
+            return  # 状态变了（用户已动）
+
+        plan["awaiting_response_since"] = None  # 清掉防重复通知
+        plan["updated_at"] = time.time()
+        await self._persist(sid)
+
+        task_id = plan.get("current_task_id")
+        task = _find_task_by_id(plan["tasks"], task_id) if task_id else None
+        title = task["title"] if task else "未知任务"
+        task_id_str = task_id or "unknown"
+        logger.warning("[takeover] user response timeout sid=%s task=%s",
+                       sid[:8], task_id_str)
+
+        # 通知用户 AI 已接管
+        await self._notify_user(
+            sid,
+            f"⚠️ 5 分钟内未收到响应，AstrBot AI 已接管处理「{title}」的超时情况。")
+
+        # 给 AstrBot 推一条 user-style 消息，触发 LLM 决策
+        umo = plan.get("umo")
+        if umo:
+            prompt = (
+                f"[Takeover 超时升级]\n"
+                f"Plan {plan['id']} 的任务「{title}」（task_id={task_id_str}）"
+                f"超过 30 分钟未完成，且用户在 5 分钟内未响应。\n"
+                f"\n"
+                f"请按以下步骤处理：\n"
+                f"1. 调用 hapi_coding_takeover_check 诊断 HAPI 当前状态\n"
+                f"2. 根据返回的 recommendation 字段决定：\n"
+                f"   - wait: 调用 hapi_coding_takeover_control(action='resume') 重启等待\n"
+                f"   - accept: 调用 hapi_coding_takeover_control(action='accept') 采纳结果\n"
+                f"   - manual: 用户人工介入更合适，向用户解释当前情况并等待指令")
+            try:
+                await self.plugin.sse_listener._send_user_message(umo, prompt)
+            except Exception as e:
+                logger.warning("[takeover] 给 LLM 推升级 prompt 失败 sid=%s: %s",
+                               sid[:8], e)
 
     # ════════════════════════════════════════
     # 执行循环（核心）
@@ -348,8 +658,10 @@ class TakeoverManager:
             "task_id": task["id"],
         }
 
-        # 更新状态
+        # 更新状态（task 上记录发送上下文，sweep 后 check/accept 仍可用）
         task["status"] = "running"
+        task["pre_send_seq"] = pre_send_seq
+        task["sent_at"] = time.time()
         plan["current_task_id"] = task["id"]
         plan["updated_at"] = time.time()
         await self._persist(sid)
@@ -363,16 +675,27 @@ class TakeoverManager:
             f"▶️ [{done + 1}/{total}] 正在执行: {task['title']}\n\n"
             f"📝 发送指令:\n> {preview}")
 
-    async def on_task_completed(self, sid: str, response: str):
-        """HAPI 任务完成后的评估循环（由 sse_listener 调用）"""
+    async def on_task_completed(self, sid: str, response: str,
+                                ctx_task_id: str | None = None):
+        """HAPI 任务完成后的评估循环（由 sse_listener 调用）。
+
+        ctx_task_id: 注册回调时记录的 task_id，用于防止 cancel→新 plan 间隙的旧 completion
+                     被错误评估到新任务。
+        """
         plan = self._plans.get(sid)
         if not plan:
             return
 
-        task_id = plan.get("current_task_id")
-        task = _find_task_by_id(plan["tasks"], task_id) if task_id else None
+        current_task_id = plan.get("current_task_id")
+        if ctx_task_id and ctx_task_id != current_task_id:
+            logger.warning(
+                "[takeover] discard stale completion: ctx_task_id=%s current=%s status=%s",
+                ctx_task_id, current_task_id, plan["status"])
+            return
+
+        task = _find_task_by_id(plan["tasks"], current_task_id) if current_task_id else None
         if not task:
-            logger.warning("[takeover] completed but task not found: %s", task_id)
+            logger.warning("[takeover] completed but task not found: %s", current_task_id)
             return
 
         # 调用 LLM 评估

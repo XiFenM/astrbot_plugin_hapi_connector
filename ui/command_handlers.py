@@ -1635,7 +1635,7 @@ class CommandHandlers:
     # ── takeover ──
 
     async def cmd_takeover(self, event: AstrMessageEvent, args: str = ""):
-        """Takeover 全盘接管: /hapi takeover [status|pause|resume|cancel]"""
+        """Takeover 全盘接管: /hapi takeover [status|check|pause|resume|skip|accept|cancel]"""
         mgr = getattr(self.plugin, 'takeover_mgr', None)
         if not mgr:
             yield event.plain_result("当前未启用 takeover 模式。\n请在插件配置中设置 auto_decision_mode = takeover")
@@ -1655,19 +1655,19 @@ class CommandHandlers:
                 yield event.plain_result("当前 session 无 takeover 计划。")
             else:
                 yield event.plain_result(mgr.format_plan_status(plan))
-        elif sub == "pause":
-            result = await mgr.control(sid, "pause")
-            yield event.plain_result(result)
-        elif sub == "resume":
-            result = await mgr.control(sid, "resume")
-            yield event.plain_result(result)
-        elif sub == "cancel":
-            result = await mgr.control(sid, "cancel")
+        elif sub == "check":
+            text = await mgr.check_for_user(sid)
+            yield event.plain_result(text)
+        elif sub in ("pause", "resume", "skip", "accept", "cancel"):
+            result = await mgr.control(sid, sub)
             yield event.plain_result(result)
         else:
             yield event.plain_result(
                 "用法: /hapi takeover [子命令]\n"
-                "  status  — 查看当前计划和进度（默认）\n"
+                "  status  — 查看当前计划和进度（默认，本地状态，不调 API）\n"
+                "  check   — 实时诊断 HAPI 当前状态并给推荐（sweep 暂停后用这个）\n"
                 "  pause   — 暂停执行（当前任务完成后）\n"
-                "  resume  — 恢复执行\n"
-                "  cancel  — 取消计划")
+                "  resume  — 恢复执行（重做当前任务）\n"
+                "  skip    — 跳过当前任务，推进到下一个\n"
+                "  accept  — 把 HAPI 当前回应当作任务结果继续推进\n"
+                "  cancel  — 取消计划并通知 HAPI 中止任务")

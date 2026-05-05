@@ -38,8 +38,29 @@ async def _fake_fetch_messages(client, sid, limit=10):
     return []
 
 
+_abort_session_log = []
+_abort_session_result = (True, "已中断 [test]")
+
+
+async def _fake_abort_session(client, sid):
+    _abort_session_log.append({"sid": sid})
+    return _abort_session_result
+
+
+_session_detail_state = {"thinking": False, "active": False}
+_session_detail_error: Exception | None = None
+
+
+async def _fake_fetch_session_detail(client, sid):
+    if _session_detail_error is not None:
+        raise _session_detail_error
+    return {"id": sid, **_session_detail_state}
+
+
 _session_ops.send_message = _fake_send_message
 _session_ops.fetch_messages = _fake_fetch_messages
+_session_ops.abort_session = _fake_abort_session
+_session_ops.fetch_session_detail = _fake_fetch_session_detail
 sys.modules[f"{_ops_pkg}.session_ops"] = _session_ops
 
 # stub formatters
@@ -166,8 +187,18 @@ class FakeContext:
         return Resp()
 
 
+class FakeLLMIntegration:
+    def __init__(self, completion_response=""):
+        self.completion_response = completion_response
+        self.fetch_call_log = []
+
+    async def _fetch_completion_response(self, sid, pre_send_seq):
+        self.fetch_call_log.append({"sid": sid, "pre_send_seq": pre_send_seq})
+        return self.completion_response
+
+
 class FakePlugin:
-    def __init__(self, llm_response=None):
+    def __init__(self, llm_response=None, completion_response=""):
         self.config = {"takeover_max_tasks": 10}
         self.client = None
         self.state_mgr = FakeStateMgr()
@@ -177,6 +208,7 @@ class FakePlugin:
              "metadata": {"path": "/home/user/project", "flavor": "claude"}}
         ]
         self.sse_listener = FakeSSEListener()
+        self.llm_integration = FakeLLMIntegration(completion_response)
 
 
 # ──── 辅助 ────
@@ -396,9 +428,15 @@ class TestControlFlow:
         mgr = TakeoverManager(plugin)
         plan = make_plan(status="executing")
         mgr._plans["sid_001"] = plan
+        _abort_session_log.clear()
+        plugin.sse_listener._pending_takeover_completions["sid_001"] = {
+            "pre_send_seq": 1, "ts": 0, "task_id": "x"}
         result = await mgr.control("sid_001", "cancel")
         assert "取消" in result
         assert plan["status"] == "cancelled"
+        # cancel 现在会调 abort_session 并 pop pending ctx
+        assert _abort_session_log == [{"sid": "sid_001"}]
+        assert "sid_001" not in plugin.sse_listener._pending_takeover_completions
 
     @pytest.mark.asyncio
     async def test_control_no_plan(self):
@@ -698,3 +736,365 @@ class TestJsonParsing:
 
     def test_parse_plan_json_empty_tasks(self):
         assert self.mgr._parse_plan_json('{"tasks": []}') is None
+
+
+# ════════════════════════════════════════════════════════════════
+# 新增测试：超时清理与 sweep 处理
+# ════════════════════════════════════════════════════════════════
+
+
+def _make_running_plan(task_id="task_running"):
+    """构造一个正在执行某任务的 plan（task running、plan executing）。"""
+    tasks = [
+        _create_task({"title": "前置完成的任务", "description": "d0"}, 0),
+        _create_task({"title": "卡住中的任务", "description": "d1"}, 1),
+        _create_task({"title": "后续待办", "description": "d2"}, 2),
+    ]
+    tasks[0]["status"] = "done"
+    tasks[1]["status"] = "running"
+    tasks[1]["pre_send_seq"] = 100
+    tasks[1]["sent_at"] = 1000.0
+    tasks[1]["id"] = task_id
+    plan = make_plan(status="executing", tasks=tasks)
+    plan["current_task_id"] = task_id
+    return plan
+
+
+@pytest.mark.asyncio
+class TestStaleHandling:
+    """on_task_completed 校验 + on_sweep_timeout + on_user_response_timeout"""
+
+    async def test_on_task_completed_rejects_stale_ctx_task_id(self):
+        plugin = FakePlugin(llm_response='{"task_status":"done"}')
+        mgr = TakeoverManager(plugin)
+        plan = _make_running_plan("real_task")
+        mgr._plans["sid_001"] = plan
+
+        # 旧 ctx 的 task_id 与当前 current_task_id 不一致
+        await mgr.on_task_completed("sid_001", "some response", ctx_task_id="stale_task")
+
+        # 应被丢弃：task 状态不变、没有调 LLM 评估
+        task = _find_task_by_id(plan["tasks"], "real_task")
+        assert task["status"] == "running"
+        assert task["result_summary"] is None
+
+    async def test_on_sweep_timeout_rolls_back_running_task(self):
+        plugin = FakePlugin()
+        mgr = TakeoverManager(plugin)
+        plan = _make_running_plan()
+        mgr._plans["sid_001"] = plan
+
+        await mgr.on_sweep_timeout("sid_001", "task_running")
+
+        task = _find_task_by_id(plan["tasks"], "task_running")
+        assert task["status"] == "pending"  # 回滚
+        assert plan["status"] == "paused"
+        assert plan["awaiting_response_since"] is not None  # 启动 5min 计时
+        # 用户收到通知
+        assert any("超过 30 分钟" in m["text"]
+                   for m in plugin.sse_listener.sent_messages)
+
+    async def test_on_sweep_timeout_no_action_if_not_executing(self):
+        plugin = FakePlugin()
+        mgr = TakeoverManager(plugin)
+        plan = _make_running_plan()
+        plan["status"] = "cancelled"  # 已取消
+        mgr._plans["sid_001"] = plan
+
+        await mgr.on_sweep_timeout("sid_001", "task_running")
+
+        assert plan["status"] == "cancelled"
+        assert plan.get("awaiting_response_since") is None
+        assert len(plugin.sse_listener.sent_messages) == 0
+
+    async def test_on_user_response_timeout_notifies_ai(self):
+        plugin = FakePlugin()
+        mgr = TakeoverManager(plugin)
+        plan = _make_running_plan()
+        plan["status"] = "paused"
+        plan["awaiting_response_since"] = 100.0  # 在过去
+        mgr._plans["sid_001"] = plan
+
+        await mgr.on_user_response_timeout("sid_001")
+
+        assert plan["awaiting_response_since"] is None  # 清掉防重复
+        # 用户和 LLM 都收到消息（FakeSSEListener 的 _send_user_message 用同一个 list）
+        msgs = plugin.sse_listener.sent_messages
+        assert any("AstrBot AI 已接管" in m["text"] for m in msgs)
+        assert any("hapi_coding_takeover_check" in m["text"] for m in msgs)
+
+    async def test_on_user_response_timeout_skips_if_not_paused(self):
+        plugin = FakePlugin()
+        mgr = TakeoverManager(plugin)
+        plan = _make_running_plan()
+        plan["status"] = "executing"  # 用户已自行 resume
+        plan["awaiting_response_since"] = 100.0
+        mgr._plans["sid_001"] = plan
+
+        await mgr.on_user_response_timeout("sid_001")
+
+        # 字段不被清，不发通知
+        assert plan["awaiting_response_since"] == 100.0
+        assert len(plugin.sse_listener.sent_messages) == 0
+
+    async def test_on_user_response_timeout_skips_if_already_cleared(self):
+        plugin = FakePlugin()
+        mgr = TakeoverManager(plugin)
+        plan = _make_running_plan()
+        plan["status"] = "paused"
+        plan["awaiting_response_since"] = None  # 已被清掉
+        mgr._plans["sid_001"] = plan
+
+        await mgr.on_user_response_timeout("sid_001")
+
+        assert len(plugin.sse_listener.sent_messages) == 0
+
+
+@pytest.mark.asyncio
+class TestCheckCore:
+    """check 核心函数 + 用户/AI formatter"""
+
+    async def test_check_returns_recommendation_wait_when_thinking(self):
+        global _session_detail_state, _session_detail_error
+        _session_detail_state = {"thinking": True, "active": False}
+        _session_detail_error = None
+        plugin = FakePlugin(completion_response="some output that's long enough " * 5)
+        mgr = TakeoverManager(plugin)
+        plan = _make_running_plan()
+        plan["status"] = "paused"
+        mgr._plans["sid_001"] = plan
+
+        result = await mgr.check("sid_001")
+
+        assert result["ok"] is True
+        assert result["thinking"] is True
+        assert result["recommendation"] == "wait"
+
+    async def test_check_returns_recommendation_accept_when_idle_with_output(self):
+        global _session_detail_state, _session_detail_error
+        _session_detail_state = {"thinking": False, "active": False}
+        _session_detail_error = None
+        plugin = FakePlugin(completion_response="x" * 200)  # 长响应
+        mgr = TakeoverManager(plugin)
+        plan = _make_running_plan()
+        plan["status"] = "paused"
+        mgr._plans["sid_001"] = plan
+
+        result = await mgr.check("sid_001")
+
+        assert result["ok"] is True
+        assert result["has_output"] is True
+        assert result["recommendation"] == "accept"
+
+    async def test_check_returns_recommendation_manual_when_idle_no_output(self):
+        global _session_detail_state, _session_detail_error
+        _session_detail_state = {"thinking": False, "active": False}
+        _session_detail_error = None
+        plugin = FakePlugin(completion_response="")  # 空响应
+        mgr = TakeoverManager(plugin)
+        plan = _make_running_plan()
+        plan["status"] = "paused"
+        mgr._plans["sid_001"] = plan
+
+        result = await mgr.check("sid_001")
+
+        assert result["ok"] is True
+        assert result["has_output"] is False
+        assert result["recommendation"] == "manual"
+
+    async def test_check_returns_unreachable_on_api_error(self):
+        global _session_detail_state, _session_detail_error
+        _session_detail_state = {"thinking": False, "active": False}
+        _session_detail_error = ConnectionError("HAPI down")
+        plugin = FakePlugin()
+        mgr = TakeoverManager(plugin)
+        plan = _make_running_plan()
+        mgr._plans["sid_001"] = plan
+
+        result = await mgr.check("sid_001")
+        _session_detail_error = None  # 复位
+
+        assert result["ok"] is False
+        assert result["reason"] == "hapi_unreachable"
+        assert "HAPI down" in result["error"]
+
+    async def test_check_returns_no_plan_when_no_plan(self):
+        plugin = FakePlugin()
+        mgr = TakeoverManager(plugin)
+
+        result = await mgr.check("sid_unknown")
+
+        assert result["ok"] is False
+        assert result["reason"] == "no_plan"
+
+    async def test_check_for_user_clears_awaiting_response_since(self):
+        global _session_detail_state, _session_detail_error
+        _session_detail_state = {"thinking": False, "active": False}
+        _session_detail_error = None
+        plugin = FakePlugin(completion_response="x" * 200)
+        mgr = TakeoverManager(plugin)
+        plan = _make_running_plan()
+        plan["status"] = "paused"
+        plan["awaiting_response_since"] = 100.0
+        mgr._plans["sid_001"] = plan
+
+        text = await mgr.check_for_user("sid_001")
+
+        assert plan["awaiting_response_since"] is None
+        assert "Takeover 诊断" in text or "诊断" in text
+
+    async def test_check_for_llm_returns_structured_text(self):
+        global _session_detail_state, _session_detail_error
+        _session_detail_state = {"thinking": False, "active": False}
+        _session_detail_error = None
+        plugin = FakePlugin(completion_response="x" * 200)
+        mgr = TakeoverManager(plugin)
+        plan = _make_running_plan()
+        plan["status"] = "paused"
+        plan["awaiting_response_since"] = 100.0
+        mgr._plans["sid_001"] = plan
+
+        text = await mgr.check_for_llm("sid_001")
+
+        assert plan["awaiting_response_since"] is None
+        assert "recommendation=accept" in text
+        assert "hapi_thinking=False" in text
+
+
+@pytest.mark.asyncio
+class TestSkipAccept:
+    """_skip / _accept 控制动作"""
+
+    async def test_skip_marks_task_skipped_and_advances(self):
+        plugin = FakePlugin()
+        mgr = TakeoverManager(plugin)
+        plan = _make_running_plan()
+        plan["status"] = "paused"
+        plan["awaiting_response_since"] = 100.0
+        mgr._plans["sid_001"] = plan
+
+        result = await mgr.control("sid_001", "skip")
+
+        task = _find_task_by_id(plan["tasks"], "task_running")
+        assert task["status"] == "skipped"
+        assert plan["status"] == "executing"
+        assert plan["awaiting_response_since"] is None
+        assert "已跳过" in result
+
+    async def test_skip_already_done_task_advances(self):
+        plugin = FakePlugin()
+        mgr = TakeoverManager(plugin)
+        plan = _make_running_plan()
+        # 任务已经完成（pause 时刚好完成但未推进）
+        task = _find_task_by_id(plan["tasks"], "task_running")
+        task["status"] = "done"
+        plan["status"] = "paused"
+        mgr._plans["sid_001"] = plan
+
+        result = await mgr.control("sid_001", "skip")
+
+        # 不覆盖 done 状态
+        assert task["status"] == "done"
+        assert plan["status"] == "executing"
+        assert "已完成" in result
+
+    async def test_skip_invalid_status_rejected(self):
+        plugin = FakePlugin()
+        mgr = TakeoverManager(plugin)
+        plan = make_plan(status="confirming")  # 还没开始
+        mgr._plans["sid_001"] = plan
+
+        result = await mgr.control("sid_001", "skip")
+
+        assert "❌" in result
+        assert plan["status"] == "confirming"
+
+    async def test_accept_with_meaningful_response_calls_on_task_completed(self):
+        plugin = FakePlugin(
+            llm_response='{"task_status":"done","task_summary":"OK","goal_achieved":true}',
+            completion_response="x" * 200)
+        mgr = TakeoverManager(plugin)
+        plan = _make_running_plan()
+        plan["status"] = "paused"
+        mgr._plans["sid_001"] = plan
+
+        result = await mgr.control("sid_001", "accept")
+
+        # accept 异步触发 on_task_completed，等一轮
+        await asyncio.sleep(0.05)
+
+        assert "已采纳" in result
+        # llm_integration._fetch_completion_response 被调
+        assert len(plugin.llm_integration.fetch_call_log) == 1
+
+    async def test_accept_with_empty_response_returns_error(self):
+        plugin = FakePlugin(completion_response="")  # 短响应
+        mgr = TakeoverManager(plugin)
+        plan = _make_running_plan()
+        plan["status"] = "paused"
+        mgr._plans["sid_001"] = plan
+
+        result = await mgr.control("sid_001", "accept")
+
+        assert "❌" in result
+        # plan 状态没变
+        assert plan["status"] == "paused"
+
+
+@pytest.mark.asyncio
+class TestCancelAbort:
+    """cancel 改造：调 abort_session + pop ctx + 清 awaiting"""
+
+    async def test_cancel_calls_abort_session(self):
+        global _abort_session_result
+        _abort_session_result = (True, "已中断 [test]")
+        plugin = FakePlugin()
+        mgr = TakeoverManager(plugin)
+        plan = make_plan(status="executing")
+        mgr._plans["sid_001"] = plan
+        _abort_session_log.clear()
+
+        await mgr.control("sid_001", "cancel")
+
+        assert _abort_session_log == [{"sid": "sid_001"}]
+
+    async def test_cancel_pops_pending_completion(self):
+        plugin = FakePlugin()
+        mgr = TakeoverManager(plugin)
+        plan = make_plan(status="executing")
+        mgr._plans["sid_001"] = plan
+        plugin.sse_listener._pending_takeover_completions["sid_001"] = {
+            "pre_send_seq": 1, "ts": 0, "task_id": "x"}
+
+        await mgr.control("sid_001", "cancel")
+
+        assert "sid_001" not in plugin.sse_listener._pending_takeover_completions
+
+    async def test_cancel_succeeds_even_if_abort_fails(self):
+        global _abort_session_result
+        _abort_session_result = (False, "HAPI 不可达")
+        plugin = FakePlugin()
+        mgr = TakeoverManager(plugin)
+        plan = make_plan(status="executing")
+        mgr._plans["sid_001"] = plan
+
+        result = await mgr.control("sid_001", "cancel")
+
+        # 复位
+        _abort_session_result = (True, "已中断 [test]")
+
+        # 本地仍标 cancelled
+        assert plan["status"] == "cancelled"
+        assert "HAPI 中止失败" in result
+        assert "/hapi stop" in result  # 提示用户手动 stop
+
+    async def test_cancel_clears_awaiting_response_since(self):
+        plugin = FakePlugin()
+        mgr = TakeoverManager(plugin)
+        plan = make_plan(status="paused")
+        plan["awaiting_response_since"] = 100.0
+        mgr._plans["sid_001"] = plan
+
+        await mgr.control("sid_001", "cancel")
+
+        assert plan["awaiting_response_since"] is None

@@ -316,9 +316,18 @@ class HapiConnectorPlugin(Star):
         '''控制 Takeover 任务执行。
 
         Args:
-            action(string): start=开始执行已确认的计划 / pause=暂停（当前任务完成后） / resume=恢复执行 / cancel=取消计划
+            action(string): start=开始执行已确认的计划 / pause=暂停（当前任务完成后） / resume=恢复执行 / skip=跳过当前任务推进到下一个 / accept=把 HAPI 当前回应当作任务结果继续 / cancel=取消计划并通知 HAPI 中止
         '''
         async for result in self.llm_integration.tool_takeover_control(event, action):
+            yield result
+
+    @filter.llm_tool(name="hapi_coding_takeover_check")
+    async def tool_takeover_check(self, event: AstrMessageEvent):
+        '''诊断当前 Takeover 任务的执行情况。调 HAPI REST API 拿实时状态，
+        返回 thinking/active/has_output/recommendation 等字段。
+        当收到「Takeover 超时升级」通知时，应先调用此工具再决定调用 hapi_coding_takeover_control 的哪个 action。
+        '''
+        async for result in self.llm_integration.tool_takeover_check(event):
             yield result
 
     # ──── 辅助方法 ────
