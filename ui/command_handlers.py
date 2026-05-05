@@ -76,6 +76,8 @@ class CommandHandlers:
             "routes": (self.cmd_routes, False),
             "caps": (self.cmd_caps, True),
             "learn": (self.cmd_learn, True),
+            "playbook": (self.cmd_playbook, True),
+            "pb": (self.cmd_playbook, True),
         }
         route = routes.get(subcommand)
         if route is None:
@@ -1448,6 +1450,100 @@ class CommandHandlers:
                 yield event.plain_result(result)
             else:
                 yield result
+
+    # ── playbook (F13) ──
+
+    async def cmd_playbook(self, event: AstrMessageEvent, args: str = ""):
+        """查看或修改 playbook。
+        用法：
+          /hapi playbook [session]               — 查看指定 session 的 playbook
+          /hapi playbook refine <反馈>           — 修改当前 session 的 playbook
+          /hapi playbook <session> refine <反馈> — 修改指定 session 的 playbook
+        """
+        args = args.strip()
+
+        # 解析是否为 refine 操作
+        session_target = ""
+        feedback = ""
+        is_refine = False
+
+        if " refine " in args:
+            # /hapi playbook <session> refine <feedback>
+            parts = args.split(" refine ", 1)
+            session_target = parts[0].strip()
+            feedback = parts[1].strip()
+            is_refine = True
+        elif args.lower().startswith("refine "):
+            # /hapi playbook refine <feedback>
+            feedback = args[7:].strip()
+            is_refine = True
+        elif args.lower() == "refine":
+            yield event.plain_result("❌ 请提供修改意见，例如：\n/hapi playbook refine 删除关于测试的约定，改为更注重代码简洁性")
+            return
+        else:
+            session_target = args
+
+        if is_refine:
+            if not feedback:
+                yield event.plain_result("❌ 修改意见不能为空，请描述你的修改意向")
+                return
+            async for r in self._playbook_refine(event, session_target, feedback):
+                yield r
+        else:
+            async for r in self._playbook_view(event, session_target):
+                yield r
+
+    async def _playbook_view(self, event: AstrMessageEvent, session_target: str = ""):
+        """查看 playbook 内容"""
+        pb_key, display_name, _ = self.plugin.llm_integration.resolve_playbook_key(event, session_target)
+        if not pb_key:
+            if session_target:
+                yield event.plain_result(f"❌ 未找到 session「{session_target}」，或该 session 没有工作目录信息")
+            else:
+                yield event.plain_result("❌ 当前没有活跃 session，请先切换到一个 session")
+            return
+
+        playbook = self.state_mgr.get_playbook(pb_key)
+        if not playbook:
+            yield event.plain_result(
+                f"📭 项目 [{display_name}] 还没有 Playbook\n"
+                f"运行 /hapi learn 分析历史记录并生成"
+            )
+            return
+
+        yield event.plain_result(f"📋 [{display_name}] 的 Playbook\n\n{playbook}\n\n"
+                                  f"💡 如需修改，发送：/hapi playbook refine <你的意见>")
+
+    async def _playbook_refine(self, event: AstrMessageEvent, session_target: str, feedback: str):
+        """根据用户反馈修改 playbook"""
+        pb_key, display_name, work_dir = self.plugin.llm_integration.resolve_playbook_key(event, session_target)
+        if not pb_key:
+            if session_target:
+                yield event.plain_result(f"❌ 未找到 session「{session_target}」，或该 session 没有工作目录信息")
+            else:
+                yield event.plain_result("❌ 当前没有活跃 session，请先切换到一个 session")
+            return
+
+        current = self.state_mgr.get_playbook(pb_key)
+        if not current:
+            yield event.plain_result(
+                f"📭 项目 [{display_name}] 还没有 Playbook，请先运行 /hapi learn 生成"
+            )
+            return
+
+        yield event.plain_result(f"🔧 正在根据你的意见修改 [{display_name}] 的 Playbook...")
+
+        refined = await self.plugin.llm_integration.refine_playbook_with_llm(
+            current, feedback, work_dir or display_name, event
+        )
+        if not refined:
+            yield event.plain_result("❌ LLM 修改失败，请稍后重试")
+            return
+
+        self.state_mgr.set_playbook(pb_key, refined)
+        await self.state_mgr.persist_playbook(pb_key)
+
+        yield event.plain_result(f"✅ [{display_name}] 的 Playbook 已更新！\n\n{refined}")
 
     # ── reset ──
 

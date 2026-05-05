@@ -1128,3 +1128,70 @@ quick_prefix (快捷前缀): {quick_prefix}
         else:
             yield "命令执行完成"
 
+    # ──── Playbook 查看与修改辅助 ────
+
+    def resolve_playbook_key(self, event: AstrMessageEvent, session_target: str = "") -> tuple[str | None, str | None, str | None]:
+        """解析目标 session 对应的 playbook key。
+
+        Returns:
+            (pb_key, display_name, work_dir)  三者均为 None 表示解析失败
+        """
+        sid = None
+        target = session_target.strip()
+        if target:
+            if target.isdigit():
+                visible = self.state_mgr.visible_sessions_for_window(event, self.sessions_cache)
+                idx = int(target) - 1
+                if 0 <= idx < len(visible):
+                    sid = visible[idx].get("id")
+            if not sid:
+                for s in self.sessions_cache:
+                    if s.get("id", "").startswith(target):
+                        sid = s["id"]
+                        break
+        if not sid:
+            sid = self._effective_sid(event)
+        if not sid:
+            return None, None, None
+
+        session = next((s for s in self.sessions_cache if s.get("id") == sid), None)
+        if not session:
+            return None, None, None
+
+        machine_id = session.get("machineId", "")
+        work_dir = session.get("metadata", {}).get("path", "")
+        if not work_dir:
+            return None, None, None
+
+        pb_key = self._playbook_key(machine_id, work_dir)
+        display_name = work_dir.rstrip("/").split("/")[-1] or work_dir
+        return pb_key, display_name, work_dir
+
+    async def refine_playbook_with_llm(self, current_playbook: str, feedback: str,
+                                        work_dir: str, event: AstrMessageEvent) -> str | None:
+        """调用 LLM 根据用户反馈针对性修改 playbook，返回修改后的完整文本。"""
+        system_prompt = (
+            "你是 Playbook 编辑助手。用户对当前 Playbook 有修改意见，请根据反馈对 Playbook 进行针对性修改。\n"
+            "规则：\n"
+            "1. 只修改用户明确提出异议或要求修改的部分，其余内容保持不变\n"
+            "2. 保持 Playbook 的格式结构（## 有效做法、## 应避免、## 项目约定、## 常用工作流）\n"
+            "3. 输出完整的修改后 Playbook，不要附加额外解释说明\n"
+            "4. 使用中文，总长度控制在合理范围内"
+        )
+        prompt = (
+            f"当前项目：{work_dir}\n\n"
+            f"当前 Playbook：\n{current_playbook}\n\n"
+            f"用户反馈：{feedback}\n\n"
+            "请根据用户反馈修改 Playbook："
+        )
+        try:
+            umo = event.unified_msg_origin
+            prov = self.plugin.context.get_using_provider(umo=umo)
+            if not prov:
+                return None
+            resp = await prov.text_chat(system_prompt=system_prompt, prompt=prompt)
+            return resp.completion_text.strip() or None
+        except Exception as e:
+            logger.warning("[playbook] refine 失败: %s", e)
+            return None
+
