@@ -80,6 +80,8 @@ class CommandHandlers:
             "learn": (self.cmd_learn, True),
             "playbook": (self.cmd_playbook, True),
             "pb": (self.cmd_playbook, True),
+            "takeover": (self.cmd_takeover, True),
+            "tk": (self.cmd_takeover, True),
         }
         route = routes.get(subcommand)
         if route is None:
@@ -1629,3 +1631,43 @@ class CommandHandlers:
         await self.plugin._refresh_sessions()
 
         yield event.plain_result("✓ 已重置所有状态\n捕获关系和窗口状态已清空，默认窗口和 flavor 默认路由已保留")
+
+    # ── takeover ──
+
+    async def cmd_takeover(self, event: AstrMessageEvent, args: str = ""):
+        """Takeover 全盘接管: /hapi takeover [status|pause|resume|cancel]"""
+        mgr = getattr(self.plugin, 'takeover_mgr', None)
+        if not mgr:
+            yield event.plain_result("当前未启用 takeover 模式。\n请在插件配置中设置 auto_decision_mode = takeover")
+            return
+
+        await self.state_mgr.set_user_state(event)
+        sid = self.state_mgr.effective_sid(event)
+        if not sid:
+            yield event.plain_result("请先用 /hapi sw <序号> 选择一个 session")
+            return
+
+        sub = args.strip().lower()
+
+        if not sub or sub == "status":
+            plan = mgr.get_plan(sid)
+            if not plan:
+                yield event.plain_result("当前 session 无 takeover 计划。")
+            else:
+                yield event.plain_result(mgr.format_plan_status(plan))
+        elif sub == "pause":
+            result = await mgr.control(sid, "pause")
+            yield event.plain_result(result)
+        elif sub == "resume":
+            result = await mgr.control(sid, "resume")
+            yield event.plain_result(result)
+        elif sub == "cancel":
+            result = await mgr.control(sid, "cancel")
+            yield event.plain_result(result)
+        else:
+            yield event.plain_result(
+                "用法: /hapi takeover [子命令]\n"
+                "  status  — 查看当前计划和进度（默认）\n"
+                "  pause   — 暂停执行（当前任务完成后）\n"
+                "  resume  — 恢复执行\n"
+                "  cancel  — 取消计划")

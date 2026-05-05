@@ -69,4 +69,20 @@ description: 通过 hapi_coding 工具调用远程 AI 编程助手（Claude Code
 - "帮我改一下代码"（太模糊）
 - "写一个完整的电商系统"（范围太大，应拆分）
 
+## Takeover 全盘接管模式
+
+当 auto_decision_mode = takeover 时，可使用全盘接管工作流，适合复杂多步骤目标：
+
+1. 用户描述最终目标 → 调用 `hapi_coding_takeover_plan` 规划任务列表
+2. 系统展示任务计划，用户确认或提出修改意见
+3. 用户确认后 → 调用 `hapi_coding_takeover_control(action="start")` 开始执行
+4. 系统自动逐步执行任务，每完成一个自动评估并推进下一个
+5. 执行期间用户可随时：
+   - `hapi_coding_takeover_status` 查看进度
+   - `hapi_coding_takeover_control(action="pause")` 暂停
+   - `hapi_coding_takeover_control(action="resume")` 恢复
+   - `hapi_coding_takeover_control(action="cancel")` 取消
+
+注意：takeover 继承 auto 模式的全部审批能力，高风险操作仍会上报。
+
 详细用法见 [ADVANCED.md](ADVANCED.md)，问题排查见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。

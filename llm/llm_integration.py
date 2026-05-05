@@ -151,6 +151,9 @@ class LLMIntegration:
             "hapi_coding_list_models",
             "hapi_coding_switch_model",
             "hapi_coding_compact_context",
+            "hapi_coding_takeover_plan",
+            "hapi_coding_takeover_status",
+            "hapi_coding_takeover_control",
         }
 
         # 决定要移除的工具
@@ -1223,6 +1226,80 @@ quick_prefix (快捷前缀): {quick_prefix}
             yield "已触发上下文压缩，处理完成后系统会自动通知。"
         else:
             yield f"触发压缩失败: {msg}"
+
+    # ──── Takeover 全盘接管工具 ────
+
+    async def tool_takeover_plan(self, event: AstrMessageEvent, goal: str, modification: str = ""):
+        """创建或修改 takeover 任务计划"""
+        mgr = getattr(self.plugin, 'takeover_mgr', None)
+        if not mgr:
+            yield "当前未启用 takeover 模式。请在插件配置中设置 auto_decision_mode = takeover"
+            return
+        sid = self._effective_sid(event)
+        if not sid:
+            yield self._missing_session_text()
+            return
+
+        # 创建/修改计划需要审批
+        action_desc = "修改任务计划" if modification else f"创建任务计划: {goal[:50]}"
+        approved, reason = await self._require_approval(
+            "hapi_coding_takeover_plan", {"action": action_desc}, event)
+        if not approved:
+            if reason == "timeout":
+                yield "操作已超时取消。"
+            elif reason == "notification_failed":
+                yield "操作失败：无法发送审批通知。"
+            else:
+                yield "操作已被拒绝。"
+            return
+
+        umo = event.unified_msg_origin
+        if modification:
+            result = await mgr.modify_plan(sid, umo, modification)
+        else:
+            result = await mgr.create_plan(sid, umo, goal)
+        yield result
+
+    async def tool_takeover_status(self, event: AstrMessageEvent):
+        """查看当前 session 的 takeover 任务计划和执行进度"""
+        mgr = getattr(self.plugin, 'takeover_mgr', None)
+        if not mgr:
+            yield "当前未启用 takeover 模式。"
+            return
+        sid = self._effective_sid(event)
+        if not sid:
+            yield self._missing_session_text()
+            return
+        plan = mgr.get_plan(sid)
+        if not plan:
+            yield "当前 session 无活跃的 takeover 计划。"
+            return
+        yield mgr.format_plan_status(plan)
+
+    async def tool_takeover_control(self, event: AstrMessageEvent, action: str):
+        """控制 takeover 执行：start / pause / resume / cancel"""
+        mgr = getattr(self.plugin, 'takeover_mgr', None)
+        if not mgr:
+            yield "当前未启用 takeover 模式。"
+            return
+        sid = self._effective_sid(event)
+        if not sid:
+            yield self._missing_session_text()
+            return
+
+        # start 需要审批（开始执行是重大操作）
+        if action == "start":
+            approved, reason = await self._require_approval(
+                "hapi_coding_takeover_control", {"action": "start"}, event)
+            if not approved:
+                if reason == "timeout":
+                    yield "操作已超时取消。"
+                else:
+                    yield "操作已被拒绝。"
+                return
+
+        result = await mgr.control(sid, action)
+        yield result
 
     async def tool_stop_message(self, event: AstrMessageEvent):
         '''停止当前 session 的消息生成。'''

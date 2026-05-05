@@ -18,6 +18,7 @@ class StateManager:
         self._session_owners = binding_mgr._session_owners
         self._session_capabilities: dict[str, dict] = {}  # F2: 会话能力缓存（内存，不持久化）
         self._playbooks: dict[str, str] = {}  # F13: playbook 缓存，key = work_dir
+        self._takeover_plans: dict[str, dict] = {}  # Takeover: 计划缓存，key = sid
 
     # ──── 会话能力缓存 ────
 
@@ -58,6 +59,27 @@ class StateManager:
         """持久化 playbook 索引（所有 key 列表）"""
         keys = list(self._playbooks.keys())
         await self.kv.put_kv_data("playbook_keys", keys)
+
+    # ──── Takeover Plan 缓存 ────
+
+    def set_takeover_plan(self, sid: str, plan_dict: dict | None):
+        if plan_dict is None:
+            self._takeover_plans.pop(sid, None)
+        else:
+            self._takeover_plans[sid] = plan_dict
+
+    def get_takeover_plan(self, sid: str) -> dict | None:
+        return self._takeover_plans.get(sid)
+
+    def get_all_takeover_plans(self) -> dict[str, dict]:
+        return dict(self._takeover_plans)
+
+    async def persist_takeover_plan(self, sid: str):
+        plan = self._takeover_plans.get(sid)
+        await self.kv.put_kv_data(f"takeover_plan_{sid}", plan)
+        # 同步更新索引
+        keys = list(self._takeover_plans.keys())
+        await self.kv.put_kv_data("takeover_plan_sids", keys)
 
     # ──── 持久化 ────
 
@@ -354,6 +376,17 @@ class StateManager:
                 self._playbooks[key] = playbook
         if self._playbooks:
             logger.info("已加载 %d 个 playbook", len(self._playbooks))
+
+        # Takeover: 加载已持久化的计划
+        takeover_sids = await self.kv.get_kv_data("takeover_plan_sids", [])
+        for sid in takeover_sids:
+            if not isinstance(sid, str):
+                continue
+            plan = await self.kv.get_kv_data(f"takeover_plan_{sid}", None)
+            if plan and isinstance(plan, dict):
+                self._takeover_plans[sid] = plan
+        if self._takeover_plans:
+            logger.info("已加载 %d 个 takeover 计划", len(self._takeover_plans))
 
     async def migrate_to_capture_model(self):
         """数据迁移：绑定模式 → 捕获+默认窗口模式"""

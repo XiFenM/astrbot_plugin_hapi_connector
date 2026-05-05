@@ -64,8 +64,11 @@ class SSEListener:
         self._request_notify_sids: set[str] = set()
         self._request_notify_task: asyncio.Task | None = None
         self._auto_decision_mgr: "AutoDecisionManager | None" = None
+        self._takeover_mgr = None  # TakeoverManager | None
         # {sid: {"pre_send_seq": int, "ts": float}}，tool_send_message 注册的完成回调上下文
         self._pending_llm_completions: dict[str, dict] = {}
+        # {sid: {"pre_send_seq": int, "ts": float, "task_id": str}}，takeover 独立完成回调
+        self._pending_takeover_completions: dict[str, dict] = {}
         # F7: SSE 断连通知状态
         self._disconnect_notified: bool = False
         self._disconnect_notify_task: asyncio.Task | None = None
@@ -73,11 +76,12 @@ class SSEListener:
     def start(self, output_level: str = "summary", remind_pending: bool = False, remind_interval: int = 180,
               auto_approve_enabled: bool = False, auto_approve_start: str = "23:00", auto_approve_end: str = "07:00",
               summary_msg_count: int = 5, max_reconnect_attempts: int = 0,
-              auto_decision_mgr=None):
+              auto_decision_mgr=None, takeover_mgr=None):
         """启动 SSE 监听任务"""
         self.output_level = output_level
         self._summary_msg_count = summary_msg_count
         self._auto_decision_mgr = auto_decision_mgr
+        self._takeover_mgr = takeover_mgr
         self._remind_enabled = remind_pending
         self._remind_interval = remind_interval
         self._auto_approve_enabled = auto_approve_enabled
@@ -622,6 +626,18 @@ class SSEListener:
                                      sid[:8], last_seq, prev_notified)
                         continue
 
+                    # Takeover 完成回调（独立于 tool_send_message 的回调）
+                    takeover_ctx = self._pending_takeover_completions.pop(sid, None)
+                    if takeover_ctx and self._takeover_mgr:
+                        try:
+                            response = await self._plugin.llm_integration._fetch_completion_response(
+                                sid, takeover_ctx["pre_send_seq"])
+                            await self._takeover_mgr.on_task_completed(sid, response)
+                        except Exception as e:
+                            logger.warning("[takeover] completion error: %s (sid=%s)", e, sid[:8])
+                        self._completion_notified_seqs[sid] = last_seq
+                        continue  # takeover 自行处理通知，跳过下面的通用通知
+
                     # 如果有 tool_send_message 注册的回调，调用 LLM 生成回复
                     try:
                         await self._llm_reply_completion(sid)
@@ -708,8 +724,17 @@ class SSEListener:
                 await self._handle_compaction_completed(sid)
 
     async def _handle_compaction_completed(self, sid: str):
-        """上下文压缩完成后的三步流程：
+        """上下文压缩完成后的处理。
 
+        Takeover 模式：由 takeover manager 处理恢复（带任务上下文）
+        其他模式：三步流程（embed → LLM 建议 → 根据模式决定）
+        """
+        # Takeover 模式优先
+        if self._takeover_mgr and self._takeover_mgr.is_active(sid):
+            await self._takeover_mgr.on_compaction_completed(sid)
+            return
+
+        """三步流程：
         1. HAPI 的压缩完成消息由 SSE 正常流程展示为 embed（自动发生）
         2. 调用 LLM 生成下一步建议，以常规 AstrBot 消息发送给用户
         3. 根据 auto_decision 模式：

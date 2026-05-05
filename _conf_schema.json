@@ -100,8 +100,8 @@
     "description": "LLM 决策模式",
     "type": "string",
     "default": "off",
-    "options": ["auto", "suggest", "off"],
-    "hint": "auto: 全自动（LLM 代替用户审批和回答，高风险操作仍上报）；suggest: 辅助（LLM 分析建议，用户手动操作）；off: 关闭"
+    "options": ["auto", "suggest", "off", "takeover"],
+    "hint": "auto: 全自动（LLM 代替用户审批和回答，高风险操作仍上报）；suggest: 辅助（LLM 分析建议，用户手动操作）；off: 关闭；takeover: 全盘接管（继承 auto + LLM 自动规划和执行多步骤任务）"
   },
   "auto_decision_max_history": {
     "description": "LLM 自动决策时拉取的最大历史消息数",
@@ -114,6 +114,12 @@
     "type": "int",
     "default": 7,
     "hint": "值越高越保守，推荐 6-8"
+  },
+  "takeover_max_tasks": {
+    "description": "Takeover 模式单个计划最大任务数（含子任务）",
+    "type": "int",
+    "default": 20,
+    "hint": "任务总数上限，防止计划过于庞大"
   },
   "default_notification_window": {
     "description": "默认通知发送窗口",
