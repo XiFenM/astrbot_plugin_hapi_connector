@@ -260,6 +260,28 @@ class HapiConnectorPlugin(Star):
         async for result in self.llm_integration.tool_stop_message(event):
             yield result
 
+    @filter.llm_tool(name="hapi_coding_list_models")
+    async def tool_list_models(self, event: AstrMessageEvent):
+        '''列出当前 session 可用的模型列表及当前模型。'''
+        async for result in self.llm_integration.tool_list_models(event):
+            yield result
+
+    @filter.llm_tool(name="hapi_coding_switch_model")
+    async def tool_switch_model(self, event: AstrMessageEvent, model: str):
+        '''切换当前 session 的模型（Claude / Gemini 支持）。请先调用 hapi_coding_list_models 查看可用模型。
+
+        Args:
+            model(string): 目标模型名称，如 sonnet / opus / opus[1m] / gemini-2.5-pro 等，或 default 恢复自动选择
+        '''
+        async for result in self.llm_integration.tool_switch_model(event, model):
+            yield result
+
+    @filter.llm_tool(name="hapi_coding_compact_context")
+    async def tool_compact_context(self, event: AstrMessageEvent):
+        '''触发当前 session 的上下文压缩。上下文过长时使用，无需等待系统提示。'''
+        async for result in self.llm_integration.tool_compact_context(event):
+            yield result
+
     @filter.llm_tool(name="hapi_coding_execute_command")
     async def tool_execute_command(self, event: AstrMessageEvent, command: str):
         '''直接执行HAPI指令。使用前请务必调用hapi_coding_list_commands查看指令格式和参数说明。

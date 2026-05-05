@@ -206,6 +206,9 @@ class AutoDecisionManager:
                 ok, msg = await session_ops.approve_permission(self.client, sid, rid)
                 if not ok:
                     logger.warning("[AutoDecision] 批准失败: %s (sid=%s)", msg, sid[:8])
+                    # 404 表示请求已不存在（被 CC 自行处理或超时），视为已处理以清理 pending
+                    if "404" in msg:
+                        return DecisionResult(handled=True)
                     return DecisionResult(handled=False)
                 self._record_decision(sid, f"工具: {tool}", "approve", reasoning)
                 await self._notify_user_approval(sid, req, "approve", reasoning, confidence)
@@ -216,6 +219,8 @@ class AutoDecisionManager:
                 ok, msg = await session_ops.deny_permission(self.client, sid, rid)
                 if not ok:
                     logger.warning("[AutoDecision] 拒绝失败: %s (sid=%s)", msg, sid[:8])
+                    if "404" in msg:
+                        return DecisionResult(handled=True)
                     return DecisionResult(handled=False)
                 self._record_decision(sid, f"工具: {tool}", "deny", reasoning)
                 await self._notify_user_approval(sid, req, "deny", reasoning, confidence)
@@ -453,6 +458,7 @@ class AutoDecisionManager:
                 prompt=prompt,
                 system_prompt=system_prompt,
                 contexts=history_contexts,
+                response_format={"type": "json_object"},
             )
             return llm_resp.completion_text.strip() or None
         except Exception as e:
@@ -609,8 +615,49 @@ class AutoDecisionManager:
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            logger.warning("[AutoDecision] JSON 解析失败: %s", text[:200])
+            pass
+
+        # 尝试从文本中提取 {...} JSON 对象
+        brace_start = text.find("{")
+        brace_end = text.rfind("}")
+        if brace_start != -1 and brace_end > brace_start:
+            try:
+                return json.loads(text[brace_start:brace_end + 1])
+            except json.JSONDecodeError:
+                pass
+
+        # 启发式回退：从纯文本中推断 action
+        lower = text.lower()
+        fallback = self._heuristic_parse(lower, text)
+        if fallback:
+            logger.info("[AutoDecision] JSON 解析失败，启发式推断: %s (原文: %s)", fallback, text[:120])
+            return fallback
+
+        logger.warning("[AutoDecision] JSON 解析失败: %s", text[:200])
+        return None
+
+    @staticmethod
+    def _heuristic_parse(lower: str, original: str) -> dict | None:
+        """从非 JSON 文本中启发式推断审批决策。"""
+        approve_kws = ("已批准", "批准", "approve", "approved", "通过", "允许", "安全")
+        deny_kws = ("拒绝", "deny", "denied", "不批准", "不允许", "危险")
+        escalate_kws = ("上报", "escalate", "不确定", "需要用户", "无法判断")
+
+        action = None
+        if any(kw in lower for kw in approve_kws):
+            action = "approve"
+        elif any(kw in lower for kw in deny_kws):
+            action = "deny"
+        elif any(kw in lower for kw in escalate_kws):
+            action = "escalate"
+
+        if not action:
             return None
+
+        # 提取简短理由（取原文前 80 字符）
+        reasoning = original[:80].replace("\n", " ").strip()
+        # 启发式推断的 confidence 固定为 7（刚过默认阈值）
+        return {"action": action, "confidence": 7, "reasoning": reasoning}
 
     def _parse_question_response(
         self, response_text: str, req: dict

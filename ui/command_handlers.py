@@ -386,36 +386,41 @@ class CommandHandlers:
 
     async def cmd_model(self, event: AstrMessageEvent, mode: str = ""):
         """查看/切换模型: /hapi model [模式名]"""
-        from ..core.constants import MODEL_MODES
         await self.state_mgr.set_user_state(event)
         sid = self.state_mgr.effective_sid(event)
         if not sid:
             yield event.plain_result("请先用 /hapi sw <序号> 选择一个 session")
             return
 
-        flavor = self.state_mgr.effective_flavor(event) or "claude"
-        if flavor != "claude":
-            yield event.plain_result("模型切换仅支持 Claude session")
+        # 动态获取可用模型
+        try:
+            model_data = await session_ops.fetch_session_models(self.client, sid)
+        except Exception:
+            yield event.plain_result("获取模型信息失败")
             return
+
+        presets = model_data.get("presets", [])
+        if not presets:
+            flavor = model_data.get("flavor", "unknown")
+            yield event.plain_result(f"当前代理类型 {flavor} 不支持模型切换")
+            return
+
+        preset_ids = ["default"] + [p.get("id", "?") for p in presets]
 
         if mode:
             target = mode
-            if mode.isdigit() and 1 <= int(mode) <= len(MODEL_MODES):
-                target = MODEL_MODES[int(mode) - 1]
-            if target not in MODEL_MODES:
-                yield event.plain_result(f"❌ 无效模式: {mode}\n可用: {', '.join(MODEL_MODES)}")
+            if mode.isdigit() and 1 <= int(mode) <= len(preset_ids):
+                target = preset_ids[int(mode) - 1]
+            # 允许预设或自定义模型名（如果 supportsCustomModel）
+            if target not in preset_ids and not model_data.get("supportsCustomModel"):
+                yield event.plain_result(f"❌ 无效模型: {mode}\n可用: {', '.join(preset_ids)}")
                 return
             ok, msg = await session_ops.set_model_mode(self.client, sid, target)
             yield event.plain_result(msg)
         else:
-            try:
-                detail = await session_ops.fetch_session_detail(self.client, sid)
-                current = detail.get("modelMode", "default")
-                text = formatters.format_model_modes(MODEL_MODES, current)
-                yield event.plain_result(text)
-            except Exception:
-                yield event.plain_result("获取模型信息失败")
-                return
+            current = model_data.get("currentModel") or "auto"
+            text = formatters.format_model_modes(preset_ids, current)
+            yield event.plain_result(text)
 
             @session_waiter(timeout=30, record_history_chains=False)
             async def model_waiter(controller: SessionController, ev: AstrMessageEvent):
@@ -424,10 +429,10 @@ class CommandHandlers:
                     controller.keep(timeout=30, reset_timeout=True)
                     return
                 target = reply
-                if reply.isdigit() and 1 <= int(reply) <= len(MODEL_MODES):
-                    target = MODEL_MODES[int(reply) - 1]
-                if target not in MODEL_MODES:
-                    await ev.send(ev.plain_result(f"无效模式，可用: {', '.join(MODEL_MODES)}"))
+                if reply.isdigit() and 1 <= int(reply) <= len(preset_ids):
+                    target = preset_ids[int(reply) - 1]
+                if target not in preset_ids and not model_data.get("supportsCustomModel"):
+                    await ev.send(ev.plain_result(f"无效模型，可用: {', '.join(preset_ids)}"))
                 else:
                     ok, msg = await session_ops.set_model_mode(self.client, sid, target)
                     await ev.send(ev.plain_result(msg))

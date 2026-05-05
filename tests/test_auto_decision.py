@@ -13,16 +13,22 @@ import types
 
 # 创建包层级
 _pkg_name = "data.plugins.astrbot_plugin_hapi_connector"
+_ops_pkg = f"{_pkg_name}.ops"
+_llm_pkg = f"{_pkg_name}.llm"
+_ui_pkg = f"{_pkg_name}.ui"
 for _partial in [
     "data",
     "data.plugins",
     _pkg_name,
+    _ops_pkg,
+    _llm_pkg,
+    _ui_pkg,
 ]:
     if _partial not in sys.modules:
         sys.modules[_partial] = types.ModuleType(_partial)
 
 # stub session_ops
-_session_ops = types.ModuleType(f"{_pkg_name}.session_ops")
+_session_ops = types.ModuleType(f"{_ops_pkg}.session_ops")
 _session_ops.fetch_messages = None
 _session_ops.answer_permission_question = None
 async def _fake_approve(client, sid, rid, answers=None):
@@ -31,14 +37,14 @@ async def _fake_deny(client, sid, rid):
     return True, "OK"
 _session_ops.approve_permission = _fake_approve
 _session_ops.deny_permission = _fake_deny
-sys.modules[f"{_pkg_name}.session_ops"] = _session_ops
+sys.modules[f"{_ops_pkg}.session_ops"] = _session_ops
 
 # stub approval_ops
-_approval_ops = types.ModuleType(f"{_pkg_name}.approval_ops")
+_approval_ops = types.ModuleType(f"{_ops_pkg}.approval_ops")
 async def _fake_answer_question(client, sid, rid, answers):
     return True, "OK"
 _approval_ops.answer_question = _fake_answer_question
-sys.modules[f"{_pkg_name}.approval_ops"] = _approval_ops
+sys.modules[f"{_ops_pkg}.approval_ops"] = _approval_ops
 
 # stub formatters
 _formatters = types.ModuleType(f"{_pkg_name}.formatters")
@@ -56,18 +62,24 @@ def _fake_label(sid, cache):
     return f"[{flavor}] {dir_name}"
 def _fake_is_question(req):
     return req.get("tool", "") in ("AskUserQuestion",)
+def _fake_format_tool_args(name, inp, max_len=100):
+    return str(inp)[:max_len] if inp else ""
 _formatters.extract_text_preview = _fake_extract
 _formatters.session_label_short = _fake_label
 _formatters.is_question_request = _fake_is_question
+_formatters.format_tool_args_readable = _fake_format_tool_args
 sys.modules[f"{_pkg_name}.formatters"] = _formatters
+sys.modules[f"{_ui_pkg}.formatters"] = _formatters
 
 # 现在可以安全导入 auto_decision（它的 from . import 会命中上面的 stub）
 import importlib
 import os
-_ad_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auto_decision.py")
-_spec = importlib.util.spec_from_file_location(f"{_pkg_name}.auto_decision", _ad_path)
+_ad_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "llm", "auto_decision.py")
+_spec = importlib.util.spec_from_file_location(f"{_llm_pkg}.auto_decision", _ad_path,
+                                                submodule_search_locations=[])
 auto_decision = importlib.util.module_from_spec(_spec)
-sys.modules[f"{_pkg_name}.auto_decision"] = auto_decision
+auto_decision.__package__ = _llm_pkg
+sys.modules[f"{_llm_pkg}.auto_decision"] = auto_decision
 _spec.loader.exec_module(auto_decision)
 AutoDecisionManager = auto_decision.AutoDecisionManager
 DecisionResult = auto_decision.DecisionResult
@@ -450,6 +462,44 @@ def test_confidence_threshold():
     print("  PASS: 置信度阈值逻辑正确")
 
 
+def test_heuristic_json_fallback():
+    """测试 19：启发式 JSON 回退 — 纯文本中推断 approve/deny"""
+    mgr = AutoDecisionManager(FakePlugin())
+
+    # 中文"已批准"
+    result = mgr._extract_json("✅ **已批准** — BMAD 代码审查工作流的发现变更阶段，纯读取操作，安全。")
+    assert result is not None
+    assert result["action"] == "approve"
+    assert result["confidence"] == 7
+
+    # 英文 "approve"
+    result = mgr._extract_json("I approve this safe read operation")
+    assert result is not None
+    assert result["action"] == "approve"
+
+    # 拒绝
+    result = mgr._extract_json("拒绝，这是危险操作")
+    assert result is not None
+    assert result["action"] == "deny"
+
+    # 上报
+    result = mgr._extract_json("不确定，需要用户判断")
+    assert result is not None
+    assert result["action"] == "escalate"
+
+    # 无法推断 → 返回 None
+    result = mgr._extract_json("这是一段普通文本，没有任何关键词")
+    assert result is None
+
+    # 混合：文本中包含 JSON 片段
+    result = mgr._extract_json('Sure! {"action": "approve", "confidence": 9, "reasoning": "safe"}')
+    assert result is not None
+    assert result["action"] == "approve"
+    assert result["confidence"] == 9  # 从 JSON 提取，非启发式
+
+    print("  PASS: 启发式 JSON 回退正确")
+
+
 # ──── 运行 ────
 
 def main():
@@ -472,6 +522,7 @@ def main():
         test_high_risk_warning_format,
         test_decision_result,
         test_confidence_threshold,
+        test_heuristic_json_fallback,
     ]
 
     passed = 0

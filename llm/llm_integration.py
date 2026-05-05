@@ -59,15 +59,17 @@ class LLMIntegration:
                                 event):
         """将当前会话状态和能力信息注入 LLM 系统提示"""
         lines = ["\n[HAPI 当前状态]"]
+        lines.append("  操作提示: 切换模型用 hapi_coding_switch_model，压缩上下文用 hapi_coding_compact_context，不要用 send_message 发送命令")
         for i, s in enumerate(visible_sessions[:5], 1):
             sid = s.get("id", "?")
             meta = s.get("metadata", {})
             title = (meta.get("summary") or {}).get("text", "(无标题)")
             flavor = meta.get("flavor", "?")
+            model = s.get("model") or "auto"
             is_thinking = s.get("thinking", False)
             is_active = s.get("active", False)
             state = "thinking" if is_thinking else ("active" if is_active else "idle")
-            lines.append(f"  [{i}] {title[:30]} | {flavor} | {state} | {sid[:8]}")
+            lines.append(f"  [{i}] {title[:30]} | {flavor}:{model} | {state} | {sid[:8]}")
 
             # 附加能力详情
             caps = self.state_mgr.get_capabilities(sid)
@@ -146,6 +148,9 @@ class LLMIntegration:
             "hapi_coding_list_machines",       # F12
             "hapi_coding_list_session_paths",    # F12
             "hapi_coding_learn_history",          # F13
+            "hapi_coding_list_models",
+            "hapi_coding_switch_model",
+            "hapi_coding_compact_context",
         }
 
         # 决定要移除的工具
@@ -942,6 +947,17 @@ quick_prefix (快捷前缀): {quick_prefix}
             yield self._missing_session_text()
             return
 
+        # 拦截应使用专用工具的命令
+        msg_stripped = message.strip().lower()
+        _redirect = {
+            "/model": "请使用 hapi_coding_switch_model 工具切换模型，先用 hapi_coding_list_models 查看可用模型",
+            "/compact": "请使用 hapi_coding_compact_context 工具触发上下文压缩",
+        }
+        for cmd, hint in _redirect.items():
+            if msg_stripped == cmd or msg_stripped.startswith(cmd + " "):
+                yield f"❌ 不要通过 send_message 发送 {cmd} 命令。{hint}"
+                return
+
         # 请求审批
         approved, reason = await self._require_approval("hapi_coding_send_message", {"message": message}, event)
         logger.debug(f"[tool_send_message] approved={approved}, reason={reason}")
@@ -981,16 +997,25 @@ quick_prefix (快捷前缀): {quick_prefix}
                "Claude Code 完成后系统会自动将结果推送给用户。\n"
                "请直接回复用户：任务已提交给 Claude Code，完成后会自动通知结果。")
 
-    async def _send_timeout_watch(self, sid: str, timeout: int = 300):
-        """超时监控：如果 Claude Code 在 timeout 秒内未完成，推送超时通知并清理。"""
-        await asyncio.sleep(timeout)
+    async def _send_timeout_watch(self, sid: str, warn_after: int = 600, final_timeout: int = 1800):
+        """超时监控：warn_after 秒后发警告（不清理回调），final_timeout 秒后清理。"""
         sse = self.plugin.sse_listener
+        await asyncio.sleep(warn_after)
+        # 阶段 1：警告，不清理回调
+        if sid not in sse._pending_llm_completions:
+            return  # 已正常完成
+        logger.info(f"[tool_send_message] warn timeout for sid={sid[:8]}")
+        await sse._push_notification(
+            f"⏳ Claude Code 任务已运行 {warn_after // 60} 分钟，仍在处理中。\n"
+            "可使用 /hapi msg 查看当前状态。", sid)
+        # 阶段 2：最终超时，清理回调
+        await asyncio.sleep(final_timeout - warn_after)
         ctx = sse._pending_llm_completions.pop(sid, None)
         if not ctx:
-            return  # 已正常完成，无需处理
-        logger.info(f"[tool_send_message] timeout for sid={sid[:8]}")
+            return
+        logger.info(f"[tool_send_message] final timeout for sid={sid[:8]}")
         await sse._push_notification(
-            f"⏱️ Claude Code 任务超时（{timeout}秒内未完成）。\n"
+            f"⏱️ Claude Code 任务超时（{final_timeout // 60} 分钟内未完成）。\n"
             "可使用 /hapi msg 查看当前状态。", sid)
 
     async def tool_switch_session(self, event: AstrMessageEvent, target: str):
@@ -1155,6 +1180,49 @@ quick_prefix (快捷前缀): {quick_prefix}
             yield f"✅ 已设置 {config_name} = {value}"
         else:
             yield f"不支持的配置项: {config_name}，请先调用 hapi_coding_get_config_status 查看可用配置"
+
+    async def tool_list_models(self, event: AstrMessageEvent):
+        """列出当前 session 可用的模型列表及当前模型。"""
+        sid = self._effective_sid(event)
+        if not sid:
+            yield self._missing_session_text()
+            return
+        try:
+            data = await session_ops.fetch_session_models(self.client, sid)
+            flavor = data.get("flavor", "unknown")
+            current = data.get("currentModel") or "auto"
+            presets = data.get("presets", [])
+            if not presets:
+                yield f"当前代理类型: {flavor}，暂不支持模型切换"
+                return
+            preset_list = ", ".join(p.get("id", "?") for p in presets)
+            lines = [f"当前模型: {current}", f"可用预设: {preset_list}"]
+            if data.get("supportsCustomModel"):
+                lines.append("支持自定义模型名称")
+            yield "\n".join(lines)
+        except Exception as e:
+            yield f"获取模型信息失败: {e}"
+
+    async def tool_switch_model(self, event: AstrMessageEvent, model: str):
+        """切换当前 session 的模型（Claude / Gemini 支持）。"""
+        sid = self._effective_sid(event)
+        if not sid:
+            yield self._missing_session_text()
+            return
+        ok, msg = await session_ops.set_model_mode(self.client, sid, model)
+        yield msg
+
+    async def tool_compact_context(self, event: AstrMessageEvent):
+        """触发当前 session 的上下文压缩。"""
+        sid = self._effective_sid(event)
+        if not sid:
+            yield self._missing_session_text()
+            return
+        ok, msg = await session_ops.compact_session(self.client, sid)
+        if ok:
+            yield "已触发上下文压缩，处理完成后系统会自动通知。"
+        else:
+            yield f"触发压缩失败: {msg}"
 
     async def tool_stop_message(self, event: AstrMessageEvent):
         '''停止当前 session 的消息生成。'''

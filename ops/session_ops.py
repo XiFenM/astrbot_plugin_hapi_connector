@@ -81,15 +81,39 @@ async def set_permission_mode(client: AsyncHapiClient, sid: str, mode: str) -> t
 
 
 async def set_model_mode(client: AsyncHapiClient, sid: str, model: str) -> tuple[bool, str]:
-    """设置模型模式（仅 Claude）"""
-    resp = await client.post(f"/api/sessions/{sid}/model", json={"model": model})
+    """设置模型模式（Claude / Gemini）。model 传 None 或 "default"/"auto" 表示恢复自动选择。"""
+    api_model: str | None = model
+    if model in ("default", "auto"):
+        api_model = None
+    resp = await client.post(f"/api/sessions/{sid}/model", json={"model": api_model})
     if resp.ok:
         resp.release()
-        return True, f"模型已切换为: {model}"
+        label = model if api_model else "auto"
+        return True, f"模型已切换为: {label}"
     else:
         body = await resp.text()
         resp.release()
         return False, f"切换失败: {resp.status} {body[:200]}"
+
+
+async def fetch_session_models(client: AsyncHapiClient, sid: str) -> dict:
+    """获取 session 可用的模型列表。
+    Returns: {flavor, currentModel, presets: [{id, label}], supportsCustomModel}
+    """
+    data = await client.get_json(f"/api/sessions/{sid}/models")
+    return data
+
+
+async def compact_session(client: AsyncHapiClient, sid: str) -> tuple[bool, str]:
+    """触发 session 的上下文压缩"""
+    resp = await client.post(f"/api/sessions/{sid}/compact", json={})
+    if resp.ok:
+        resp.release()
+        return True, "已触发上下文压缩"
+    else:
+        body = await resp.text()
+        resp.release()
+        return False, f"触发压缩失败: {resp.status} {body[:200]}"
 
 
 async def approve_permission(client: AsyncHapiClient, sid: str, rid: str,
