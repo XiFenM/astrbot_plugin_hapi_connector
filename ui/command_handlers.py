@@ -288,7 +288,7 @@ class CommandHandlers:
             total = len(selected)
             for i, round_msgs in enumerate(selected, 1):
                 text = formatters.format_round(round_msgs, i, total)
-                from .notification_manager import NotificationManager
+                from ..managers.notification_manager import NotificationManager
                 for chunk in NotificationManager.split_message(text):
                     yield event.plain_result(chunk)
         except Exception as e:
@@ -330,7 +330,7 @@ class CommandHandlers:
 
     async def cmd_perm(self, event: AstrMessageEvent, mode: str = ""):
         """查看/切换权限模式: /hapi perm [模式名]"""
-        from .constants import PERMISSION_MODES
+        from ..core.constants import PERMISSION_MODES
         await self.state_mgr.set_user_state(event)
         sid = self.state_mgr.effective_sid(event)
         if not sid:
@@ -386,7 +386,7 @@ class CommandHandlers:
 
     async def cmd_model(self, event: AstrMessageEvent, mode: str = ""):
         """查看/切换模型: /hapi model [模式名]"""
-        from .constants import MODEL_MODES
+        from ..core.constants import MODEL_MODES
         await self.state_mgr.set_user_state(event)
         sid = self.state_mgr.effective_sid(event)
         if not sid:
@@ -1144,7 +1144,7 @@ class CommandHandlers:
         try:
             entries = await session_ops.list_directory(self.client, sid, path=path)
             text = formatters.format_directory(entries, path=path, detail=detail, sid=sid)
-            from .notification_manager import NotificationManager
+            from ..managers.notification_manager import NotificationManager
             for chunk in NotificationManager.split_message(text):
                 yield event.plain_result(chunk)
         except Exception as e:
@@ -1167,7 +1167,7 @@ class CommandHandlers:
         try:
             files = await session_ops.list_files(self.client, sid, query=query)
             text = formatters.format_file_search(files, query=query)
-            from .notification_manager import NotificationManager
+            from ..managers.notification_manager import NotificationManager
             for chunk in NotificationManager.split_message(text):
                 yield event.plain_result(chunk)
         except Exception as e:
@@ -1329,7 +1329,7 @@ class CommandHandlers:
 
     async def cmd_bind(self, event: AstrMessageEvent, arg: str = ""):
         """设置默认发送窗口: /hapi bind [claude|codex|gemini|status|reset]"""
-        from .state_manager import NOTIFICATION_ROUTE_FLAVORS
+        from ..managers.state_manager import NOTIFICATION_ROUTE_FLAVORS
         await self.state_mgr.ensure_primary_session(event)
         sender_id = str(event.get_sender_id())
         umo = event.unified_msg_origin

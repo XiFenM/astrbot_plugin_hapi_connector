@@ -951,7 +951,7 @@ quick_prefix (快捷前缀): {quick_prefix}
             return
 
         agent = (agent or "").strip().lower()
-        from .constants import AGENTS
+        from ..core.constants import AGENTS
         if agent not in AGENTS:
             yield f"不支持的 agent: {agent}，可选: {', '.join(AGENTS)}"
             return
@@ -973,7 +973,7 @@ quick_prefix (快捷前缀): {quick_prefix}
 
         normalized_effort = (model_reasoning_effort or "").strip().lower()
         if agent == "codex":
-            from .constants import CODEX_REASONING_EFFORT_VALUES
+            from ..core.constants import CODEX_REASONING_EFFORT_VALUES
             inherit_aliases = {"", "inherit", "default", "auto"}
             if normalized_effort in inherit_aliases:
                 normalized_effort = ""
