@@ -159,6 +159,9 @@ class TakeoverManager:
         self.state_mgr = plugin.state_mgr
         self._plans: dict[str, dict] = {}  # sid → plan dict
         self._max_tasks = plugin.config.get("takeover_max_tasks", 20)
+        # 重入保护：标记 _execute_next_task 当前正在为哪些 sid 跑
+        # 避免 pause→resume 间隙的并发触发同时派发两条任务指令
+        self._executing_sids: set[str] = set()
 
     # ════════════════════════════════════════
     # 状态查询
@@ -630,7 +633,24 @@ class TakeoverManager:
     # ════════════════════════════════════════
 
     async def _execute_next_task(self, sid: str):
-        """找到下一个 pending 任务，构建指令，发送给 HAPI"""
+        """找到下一个 pending 任务，构建指令，发送给 HAPI。
+
+        重入保护：同一 sid 同一时刻只允许一个 _execute_next_task 在跑。
+        若 pause→resume 在 LLM 调用期间撞车，第二次调用直接放弃；
+        前一个完成后会通过 SSE→on_task_completed→_execute_next_task 链自然推进。
+        """
+        if sid in self._executing_sids:
+            logger.debug("[takeover] _execute_next_task 已为 sid=%s 在跑，跳过重入",
+                         sid[:8])
+            return
+        self._executing_sids.add(sid)
+        try:
+            await self._execute_next_task_impl(sid)
+        finally:
+            self._executing_sids.discard(sid)
+
+    async def _execute_next_task_impl(self, sid: str):
+        """实际执行逻辑（被 _execute_next_task 包装做重入保护）。"""
         plan = self._plans.get(sid)
         if not plan or plan["status"] != "executing":
             return

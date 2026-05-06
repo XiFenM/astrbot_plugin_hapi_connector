@@ -596,6 +596,50 @@ class TestExecution:
         assert plan["status"] == "completed"
 
     @pytest.mark.asyncio
+    async def test_execute_next_task_rejects_reentry(self):
+        """同一 sid 的并发 _execute_next_task 调用，第二个应直接放弃（pause→resume race）。"""
+        plugin = FakePlugin(llm_response="请执行")
+        mgr = TakeoverManager(plugin)
+        plan = make_plan(status="executing")
+        mgr._plans["sid_001"] = plan
+        mgr._executing_sids.add("sid_001")  # 模拟"前一个调用还在跑"
+
+        _send_message_log.clear()
+        await mgr._execute_next_task("sid_001")  # 应被拒
+
+        assert len(_send_message_log) == 0  # 没发消息
+        assert plan["tasks"][0]["status"] == "pending"  # 没动状态
+
+    @pytest.mark.asyncio
+    async def test_execute_next_task_clears_in_flight_on_exit(self):
+        """正常完成后应从 _executing_sids 移除，允许后续调用。"""
+        plugin = FakePlugin(llm_response="请执行")
+        mgr = TakeoverManager(plugin)
+        plan = make_plan(status="executing")
+        mgr._plans["sid_001"] = plan
+
+        await mgr._execute_next_task("sid_001")
+
+        assert "sid_001" not in mgr._executing_sids
+
+    @pytest.mark.asyncio
+    async def test_execute_next_task_clears_in_flight_on_exception(self):
+        """实现层抛异常时也要清掉 in-flight 标记，否则永久卡死。"""
+        plugin = FakePlugin(llm_response="请执行")
+        mgr = TakeoverManager(plugin)
+
+        async def _boom(sid):
+            raise RuntimeError("simulated failure")
+        mgr._execute_next_task_impl = _boom
+
+        try:
+            await mgr._execute_next_task("sid_001")
+        except RuntimeError:
+            pass
+
+        assert "sid_001" not in mgr._executing_sids
+
+    @pytest.mark.asyncio
     async def test_execute_paused_stops_loop(self):
         plugin = FakePlugin(llm_response="指令")
         mgr = TakeoverManager(plugin)
