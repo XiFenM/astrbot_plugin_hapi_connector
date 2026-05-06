@@ -111,6 +111,8 @@ _find_next_pending = _tm_mod._find_next_pending
 _find_task_by_id = _tm_mod._find_task_by_id
 _insert_after = _tm_mod._insert_after
 _count_tasks = _tm_mod._count_tasks
+_format_response_for_evaluation = _tm_mod._format_response_for_evaluation
+_extract_block_for_eval = _tm_mod._extract_block_for_eval
 _format_plan_text = _tm_mod._format_plan_text
 _completed_summary = _tm_mod._completed_summary
 _create_task = _tm_mod._create_task
@@ -191,10 +193,24 @@ class FakeLLMIntegration:
     def __init__(self, completion_response=""):
         self.completion_response = completion_response
         self.fetch_call_log = []
+        self.messages_call_log = []
 
     async def _fetch_completion_response(self, sid, pre_send_seq):
         self.fetch_call_log.append({"sid": sid, "pre_send_seq": pre_send_seq})
         return self.completion_response
+
+    async def _fetch_messages_after_seq(self, sid, pre_send_seq):
+        """Synthesize raw messages from completion_response for eval-formatter tests."""
+        self.messages_call_log.append({"sid": sid, "pre_send_seq": pre_send_seq})
+        if not self.completion_response:
+            return []
+        return [{
+            "seq": pre_send_seq + 1,
+            "content": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": self.completion_response}],
+            },
+        }]
 
 
 class FakePlugin:
@@ -840,6 +856,160 @@ def _make_running_plan(task_id="task_running"):
     return plan
 
 
+class TestEvalFormatter:
+    """_format_response_for_evaluation 启发式精简：保留 text + 工具动作摘要，
+    丢弃 thinking/reasoning/tool_result/edit-write 内容。"""
+
+    def _msg(self, blocks, role="assistant", seq=1):
+        return {"seq": seq, "content": {"role": role, "content": blocks}}
+
+    def test_keeps_assistant_text(self):
+        msgs = [self._msg([{"type": "text", "text": "我已完成第一步重构。"}])]
+        result = _format_response_for_evaluation(msgs)
+        assert "我已完成第一步重构。" in result
+
+    def test_drops_thinking(self):
+        msgs = [self._msg([
+            {"type": "thinking", "text": "嗯让我想想…"},
+            {"type": "text", "text": "实际答复"},
+        ])]
+        result = _format_response_for_evaluation(msgs)
+        assert "嗯让我想想" not in result
+        assert "实际答复" in result
+
+    def test_drops_tool_result(self):
+        msgs = [self._msg([
+            {"type": "text", "text": "执行了一个命令"},
+            {"type": "tool_result", "content": "stdout: 大量输出..."},
+        ])]
+        result = _format_response_for_evaluation(msgs)
+        assert "执行了一个命令" in result
+        assert "stdout" not in result
+
+    def test_drops_reasoning(self):
+        msgs = [self._msg([
+            {"type": "agent_reasoning", "text": "Codex 内部推理 (不该显示)"},
+            {"type": "text", "text": "正常输出"},
+        ])]
+        result = _format_response_for_evaluation(msgs)
+        assert "Codex 内部推理" not in result
+        assert "正常输出" in result
+
+    def test_bash_keeps_command(self):
+        msgs = [self._msg([{
+            "type": "tool_use", "name": "Bash",
+            "input": {"command": "pytest -v tests/"}
+        }])]
+        result = _format_response_for_evaluation(msgs)
+        assert "Bash" in result
+        assert "pytest -v tests/" in result
+
+    def test_edit_drops_old_new_content(self):
+        """Edit 工具应只保留文件名，old/new 内容必须丢弃。"""
+        msgs = [self._msg([{
+            "type": "tool_use", "name": "Edit",
+            "input": {
+                "file_path": "/long/path/to/auth.py",
+                "old_string": "TOKEN = 'hardcoded_secret_value'",
+                "new_string": "TOKEN = os.environ['AUTH_TOKEN']",
+            }
+        }])]
+        result = _format_response_for_evaluation(msgs)
+        assert "auth.py" in result  # 文件名在
+        assert "hardcoded_secret_value" not in result  # 原文不在
+        assert "AUTH_TOKEN" not in result  # 新文不在
+
+    def test_write_drops_content(self):
+        msgs = [self._msg([{
+            "type": "tool_use", "name": "Write",
+            "input": {"file_path": "/path/new_module.py",
+                      "content": "x" * 5000}
+        }])]
+        result = _format_response_for_evaluation(msgs)
+        assert "new_module.py" in result
+        assert "x" * 100 not in result  # 长 content 不在
+
+    def test_read_keeps_filename(self):
+        msgs = [self._msg([{
+            "type": "tool_use", "name": "Read",
+            "input": {"file_path": "/long/path/to/config.json"}
+        }])]
+        result = _format_response_for_evaluation(msgs)
+        assert "config.json" in result
+
+    def test_grep_keeps_pattern_and_path(self):
+        msgs = [self._msg([{
+            "type": "tool_use", "name": "Grep",
+            "input": {"pattern": "validate_token", "path": "src/"}
+        }])]
+        result = _format_response_for_evaluation(msgs)
+        assert "validate_token" in result
+        assert "src/" in result
+
+    def test_todowrite_compresses_to_count(self):
+        msgs = [self._msg([{
+            "type": "tool_use", "name": "TodoWrite",
+            "input": {"todos": [
+                {"status": "completed", "content": "step1"},
+                {"status": "completed", "content": "step2"},
+                {"status": "pending", "content": "step3"},
+            ]}
+        }])]
+        result = _format_response_for_evaluation(msgs)
+        assert "TodoWrite" in result
+        assert "2/3" in result
+
+    def test_summary_kept(self):
+        msgs = [self._msg([{"type": "summary", "summary": "本次完成了三件事..."}])]
+        result = _format_response_for_evaluation(msgs)
+        assert "本次完成了三件事" in result
+
+    def test_empty_messages(self):
+        result = _format_response_for_evaluation([])
+        assert result == "（无可解析的回应内容）"
+
+    def test_messages_sorted_by_seq(self):
+        msgs = [
+            self._msg([{"type": "text", "text": "第二条"}], seq=2),
+            self._msg([{"type": "text", "text": "第一条"}], seq=1),
+        ]
+        result = _format_response_for_evaluation(msgs)
+        # 第一条 seq=1 应在前面
+        assert result.index("第一条") < result.index("第二条")
+
+    def test_safety_cap_kicks_in_for_huge_input(self):
+        """构造极端长输入触发安全阀，确认首尾保留。"""
+        head_marker = "HEAD_MARKER_TEXT"
+        tail_marker = "TAIL_MARKER_TEXT"
+        msgs = [
+            self._msg([{"type": "text", "text": head_marker}], seq=1),
+            self._msg([{"type": "text", "text": "x" * 20000}], seq=2),  # 超大
+            self._msg([{"type": "text", "text": tail_marker}], seq=3),
+        ]
+        result = _format_response_for_evaluation(msgs, max_total=2000)
+        assert head_marker in result
+        assert tail_marker in result
+        assert "中间省略" in result
+        assert len(result) < 5000
+
+    def test_text_block_outweighs_tool_calls(self):
+        """text + tool_use 混合时，text 内容要在 tool 摘要前后都正确保留。"""
+        msgs = [self._msg([
+            {"type": "text", "text": "我先看一下文件"},
+            {"type": "tool_use", "name": "Read",
+             "input": {"file_path": "/p/auth.py"}},
+            {"type": "text", "text": "现在改一下。"},
+            {"type": "tool_use", "name": "Edit",
+             "input": {"file_path": "/p/auth.py", "old_string": "x", "new_string": "y"}},
+            {"type": "text", "text": "完成，已通过测试。"},
+        ])]
+        result = _format_response_for_evaluation(msgs)
+        assert "我先看一下文件" in result
+        assert "auth.py" in result
+        assert "现在改一下" in result
+        assert "完成，已通过测试" in result
+
+
 @pytest.mark.asyncio
 class TestStaleHandling:
     """on_task_completed 校验 + on_sweep_timeout + on_user_response_timeout"""
@@ -1104,8 +1274,8 @@ class TestSkipAccept:
         await asyncio.sleep(0.05)
 
         assert "已采纳" in result
-        # llm_integration._fetch_completion_response 被调
-        assert len(plugin.llm_integration.fetch_call_log) == 1
+        # _accept 现在走 raw messages 路径
+        assert len(plugin.llm_integration.messages_call_log) == 1
 
     async def test_accept_with_empty_response_returns_error(self):
         plugin = FakePlugin(completion_response="")  # 短响应

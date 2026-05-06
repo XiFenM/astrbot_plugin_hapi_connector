@@ -296,7 +296,20 @@ class HapiConnectorPlugin(Star):
 
     @filter.llm_tool(name="hapi_coding_takeover_plan")
     async def tool_takeover_plan(self, event: AstrMessageEvent, goal: str, modification: str = ""):
-        '''为当前 session 创建或修改 Takeover 任务计划。用户描述最终目标后，LLM 自动规划多步骤任务列表。
+        '''为当前 session 创建或修改 Takeover 全盘接管计划（多步骤自动执行）。
+
+        ⚠️ 仅在用户明确表达"全盘接管"语义时使用。否则按一般编程任务处理（用
+        hapi_coding_send_message 直接发指令即可），不要用本工具。
+
+        触发条件（任一即可）：
+        - 用户说"你帮我把 X 整个流程跑完"/"自己规划逐步执行"/"全权处理"
+        - 用户说"接下来这件事你自动化处理"/"我先去做别的事"
+        - 用户给了一个明确目标并要求"按步骤完成"/"分步执行"/"自己拆解"
+
+        不适用：
+        - 单步骤任务（写一个函数、改一个 bug、看一段代码）
+        - 用户只是询问 / 调试 / 让 Claude Code 做单一具体的事
+        - 用户没有"自动化执行"的明确意图（默认走 hapi_coding_send_message）
 
         Args:
             goal(string): 最终目标描述

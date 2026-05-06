@@ -904,6 +904,21 @@ quick_prefix (快捷前缀): {quick_prefix}
 
     # ──── send_message 辅助方法 ────
 
+    async def _fetch_messages_after_seq(self, sid: str, pre_send_seq: int) -> list[dict]:
+        """拉取 sid 在 pre_send_seq 之后的 raw assistant/system 消息列表。
+
+        与 _fetch_completion_response 不同：返回原始 dict 列表，不做 flatten。
+        供 takeover 评估走启发式 formatter 使用。
+        """
+        try:
+            messages = await session_ops.fetch_messages(self.client, sid, limit=50)
+        except Exception as e:
+            logger.warning(f"[takeover] fetch_messages_after_seq 失败 sid={sid[:8]}: {e}")
+            return []
+        return [m for m in messages
+                if m.get("seq", 0) > pre_send_seq
+                and m.get("content", {}).get("role") != "user"]
+
     async def _fetch_completion_response(self, sid: str, pre_send_seq: int) -> str:
         """拉取 Claude Code 在 pre_send_seq 之后的回复，格式化为文本返回给 LLM。"""
         max_response_len = 4000

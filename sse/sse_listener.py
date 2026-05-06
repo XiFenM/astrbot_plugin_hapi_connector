@@ -715,10 +715,11 @@ class SSEListener:
                     takeover_ctx = self._pending_takeover_completions.pop(sid, None)
                     if takeover_ctx and self._takeover_mgr:
                         try:
-                            response = await self._plugin.llm_integration._fetch_completion_response(
+                            # 拉 raw messages 让 takeover 自己用启发式 formatter 精简
+                            messages = await self._plugin.llm_integration._fetch_messages_after_seq(
                                 sid, takeover_ctx["pre_send_seq"])
                             await self._takeover_mgr.on_task_completed(
-                                sid, response,
+                                sid, messages,
                                 ctx_task_id=takeover_ctx.get("task_id"))
                         except Exception as e:
                             logger.warning("[takeover] completion error: %s (sid=%s)", e, sid[:8])

@@ -1658,13 +1658,14 @@ class CommandHandlers:
         elif sub == "check":
             text = await mgr.check_for_user(sid)
             yield event.plain_result(text)
-        elif sub in ("pause", "resume", "skip", "accept", "cancel"):
+        elif sub in ("start", "pause", "resume", "skip", "accept", "cancel"):
             result = await mgr.control(sid, sub)
             yield event.plain_result(result)
         else:
             yield event.plain_result(
                 "用法: /hapi takeover [子命令]\n"
                 "  status  — 查看当前计划和进度（默认，本地状态，不调 API）\n"
+                "  start   — 在已确认（confirming）的计划上开始执行\n"
                 "  check   — 实时诊断 HAPI 当前状态并给推荐（sweep 暂停后用这个）\n"
                 "  pause   — 暂停执行（当前任务完成后）\n"
                 "  resume  — 恢复执行（重做当前任务）\n"

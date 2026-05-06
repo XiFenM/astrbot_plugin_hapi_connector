@@ -136,6 +136,137 @@ def _format_plan_text(plan: dict, with_status: bool = True) -> str:
     return "\n".join(lines)
 
 
+def _format_response_for_evaluation(messages: list[dict],
+                                     max_total: int = 8000) -> str:
+    """把 HAPI 拉回的 raw 消息列表精简为 LLM 评估用的紧凑文本。
+
+    取舍策略（针对"是否完成任务"的评估场景）：
+    - 保留：模型 text 块（"做了什么/完成了什么"的话语）、final summary、event message
+    - 保留：工具调用动作摘要（执行了什么命令/编辑了哪些文件/读了哪些文件），
+            但不含具体内容（Edit 的 old/new、Write 的 content 都丢）
+    - 丢弃：thinking / reasoning / agent_reasoning / token_count 等噪音
+    - 丢弃：tool_result（工具执行的具体输出，对评估"是否完成"不必要）
+
+    safety cap: format 后仍超 max_total，截首尾保留。
+    """
+    parts: list[str] = []
+    for msg in sorted(messages, key=lambda m: m.get("seq", 0)):
+        inner = msg.get("content", {}).get("content")
+        if isinstance(inner, str):
+            if inner.strip():
+                parts.append(inner.strip())
+        elif isinstance(inner, list):
+            for block in inner:
+                t = _extract_block_for_eval(block)
+                if t:
+                    parts.append(t)
+        elif isinstance(inner, dict):
+            t = _extract_block_for_eval(inner)
+            if t:
+                parts.append(t)
+
+    if not parts:
+        return "（无可解析的回应内容）"
+
+    joined = "\n".join(parts)
+
+    # safety cap：极端长任务（百次工具调用）兜底裁剪
+    if len(joined) > max_total:
+        head = max_total // 2
+        tail = max_total - head
+        omitted = len(joined) - head - tail
+        joined = (f"{joined[:head]}\n\n... [中间省略 {omitted} 字] ...\n\n"
+                  f"{joined[-tail:]}")
+
+    return joined
+
+
+def _extract_block_for_eval(block: dict) -> str | None:
+    """从单个 block 提取评估用文本。返回 None 表示丢弃。"""
+    if not isinstance(block, dict):
+        return None
+    btype = block.get("type", "")
+
+    # 模型文本：保留全部
+    if btype == "text":
+        text = (block.get("text") or "").strip()
+        return text or None
+
+    # 工具调用：只保留动作摘要，不含具体内容
+    if btype in ("tool_use", "tool-call"):
+        return _format_tool_call_for_eval(block)
+
+    # final summary
+    if btype == "summary":
+        text = block.get("summary") or ""
+        return f"[Summary] {text[:500]}" if text else None
+
+    # 系统事件（如 compaction completed）：保留 message 类
+    if btype == "event":
+        ev = block.get("data", {})
+        if isinstance(ev, dict) and ev.get("type") == "message":
+            msg = ev.get("message", "")
+            if msg:
+                return f"[System] {msg[:200]}"
+        return None
+
+    # 包装类型递归
+    if btype in ("output", "input", "codex"):
+        data = block.get("data")
+        if isinstance(data, dict):
+            return _extract_block_for_eval(data)
+        if isinstance(data, list):
+            sub = [_extract_block_for_eval(b) for b in data]
+            sub_clean = [s for s in sub if s]
+            return "\n".join(sub_clean) if sub_clean else None
+        return None
+
+    # 其他全部丢：thinking / reasoning / tool_result / token_count / ready / ...
+    return None
+
+
+def _format_tool_call_for_eval(block: dict) -> str:
+    """工具调用 → 一行动作摘要，不含具体内容。"""
+    name = block.get("name", "?")
+    inp = block.get("input", {}) or {}
+    if not isinstance(inp, dict):
+        return f"🛠️ {name}"
+
+    if name == "Bash":
+        cmd = inp.get("command", "")
+        if isinstance(cmd, str) and cmd:
+            cmd_clean = cmd.replace("\n", " ").strip()[:200]
+            return f"🛠️ Bash: {cmd_clean}"
+        return "🛠️ Bash"
+
+    if name in ("Edit", "MultiEdit", "Write"):
+        fp = inp.get("file_path", "?")
+        base = fp.rsplit("/", 1)[-1] if "/" in fp else fp
+        return f"🛠️ {name}: {base}"
+
+    if name == "Read":
+        fp = inp.get("file_path", "?")
+        base = fp.rsplit("/", 1)[-1] if "/" in fp else fp
+        return f"🛠️ Read: {base}"
+
+    if name in ("Grep", "Glob"):
+        pat = inp.get("pattern", "?")
+        path = inp.get("path", "")
+        return f"🛠️ {name}: /{pat}/{' in ' + path if path else ''}"
+
+    if name == "Agent":
+        desc = inp.get("description") or inp.get("prompt") or ""
+        return f"🛠️ Agent: {str(desc)[:80]}"
+
+    if name == "TodoWrite":
+        todos = inp.get("todos") or []
+        done = sum(1 for t in todos if isinstance(t, dict)
+                   and t.get("status") == "completed")
+        return f"🛠️ TodoWrite ({done}/{len(todos)} 完成)"
+
+    return f"🛠️ {name}"
+
+
 def _completed_summary(tasks: list[dict]) -> str:
     """生成已完成任务的摘要（用于构建下一个指令的上下文）"""
     parts = []
@@ -228,7 +359,8 @@ class TakeoverManager:
 
         text = _format_plan_text(plan, with_status=False)
         return (f"📋 已生成任务计划：\n\n{text}\n\n"
-                "如需修改，请说明修改意见；确认无误后，请说「开始执行」。")
+                "如需修改，请说明修改意见；确认无误后，请说「开始执行」"
+                "（或直接发送 /hapi takeover start 命令）。")
 
     async def modify_plan(self, sid: str, umo: str, feedback: str) -> str:
         """根据用户反馈修改计划"""
@@ -257,7 +389,8 @@ class TakeoverManager:
 
         text = _format_plan_text(plan, with_status=False)
         return (f"📋 已更新任务计划：\n\n{text}\n\n"
-                "如需继续修改，请说明意见；确认无误后，请说「开始执行」。")
+                "如需继续修改，请说明意见；确认无误后，请说「开始执行」"
+                "（或直接发送 /hapi takeover start 命令）。")
 
     # ════════════════════════════════════════
     # 执行控制
@@ -390,15 +523,17 @@ class TakeoverManager:
         if pre_send_seq is None:
             return "❌ 找不到该任务的发送记录，无法 accept；建议 resume 重做。"
 
-        # 拉响应
+        # 拉 raw messages（让评估走启发式 formatter 精简）
         try:
-            response = await self.plugin.llm_integration._fetch_completion_response(
+            messages = await self.plugin.llm_integration._fetch_messages_after_seq(
                 sid, pre_send_seq)
         except Exception as e:
-            logger.warning("[takeover] accept fetch_response 失败 sid=%s: %s", sid[:8], e)
+            logger.warning("[takeover] accept fetch 失败 sid=%s: %s", sid[:8], e)
             return f"❌ 拉取 HAPI 响应失败：{e}\n建议 resume 或 skip。"
 
-        if not response or len(response.strip()) < 50:
+        # 启发式精简后看是否有有意义内容
+        formatted = _format_response_for_evaluation(messages)
+        if not messages or len(formatted.strip()) < 50:
             return ("❌ HAPI 没有返回足够内容（< 50 字符），无法 accept。\n"
                     "建议 check 后选择 resume 或 skip。")
 
@@ -406,11 +541,11 @@ class TakeoverManager:
         plan["status"] = "executing"
         task["status"] = "running"  # on_task_completed 期望 running
         await self._persist(sid)
-        logger.info("[takeover] accept sid=%s task=%s response_len=%d",
-                    sid[:8], task_id, len(response))
-        # 走标准评估路径推进（异步执行避免阻塞返回）
+        logger.info("[takeover] accept sid=%s task=%s msgs=%d formatted_len=%d",
+                    sid[:8], task_id, len(messages), len(formatted))
+        # 走标准评估路径推进（传 raw messages 让 on_task_completed 内部 format）
         asyncio.create_task(
-            self.on_task_completed(sid, response, ctx_task_id=task_id))
+            self.on_task_completed(sid, messages, ctx_task_id=task_id))
         return "✅ 已采纳 HAPI 当前回应作为任务结果，正在评估并推进。"
 
     # ════════════════════════════════════════
@@ -665,7 +800,10 @@ class TakeoverManager:
             await self._notify_user(sid, f"🎉 所有任务已完成！\n\n{progress}")
             return
 
-        # ��建具体指令
+        # 进度提示：LLM 调用可能耗时 5-15s，先告诉用户系统在工作
+        await self._notify_user(sid, f"🤖 正在为「{task['title']}」构造执行指令…")
+
+        # 构建具体指令
         instruction = await self._build_instruction(sid, plan, task)
         if not instruction:
             plan["status"] = "paused"
@@ -710,13 +848,20 @@ class TakeoverManager:
             f"▶️ [{done + 1}/{total}] 正在执行: {task['title']}\n\n"
             f"📝 发送指令:\n> {preview}")
 
-    async def on_task_completed(self, sid: str, response: str,
+    async def on_task_completed(self, sid: str,
+                                response: "str | list[dict]",
                                 ctx_task_id: str | None = None):
         """HAPI 任务完成后的评估循环（由 sse_listener 调用）。
 
-        ctx_task_id: 注册回调时记录的 task_id，用于防止 cancel→新 plan 间隙的旧 completion
+        response: 既可以是已格式化好的字符串（回退路径），也可以是 raw messages
+                  list[dict]。后者会用 _format_response_for_evaluation 启发式精简。
+        ctx_task_id: 注册回调时记录的 task_id，防止 cancel→新 plan 间隙的旧 completion
                      被错误评估到新任务。
         """
+        # raw messages → 启发式精简文本
+        if isinstance(response, list):
+            response = _format_response_for_evaluation(response)
+
         plan = self._plans.get(sid)
         if not plan:
             return
@@ -732,6 +877,9 @@ class TakeoverManager:
         if not task:
             logger.warning("[takeover] completed but task not found: %s", current_task_id)
             return
+
+        # 进度提示：评估也要调 LLM，几秒内会有结果
+        await self._notify_user(sid, f"🔍 「{task['title']}」执行完毕，正在评估结果…")
 
         # 调用 LLM 评估
         evaluation = await self._evaluate_task(sid, plan, task, response)
@@ -893,7 +1041,7 @@ class TakeoverManager:
             plan_summary=plan_summary,
             task_title=task["title"],
             task_description=task["description"],
-            response=response[:3000])
+            response=response)
         resp = await self._call_llm(prompts.EVALUATION_SYSTEM, user, sid=sid,
                                      json_mode=True)
         if resp:
