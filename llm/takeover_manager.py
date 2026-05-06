@@ -808,8 +808,9 @@ class TakeoverManager:
     # ════════════════════════════════════════
 
     async def _call_llm(self, system_prompt: str, user_prompt: str,
-                        sid: str = "", umo: str = "") -> str | None:
-        """调用 LLM，复用 auto_decision 的模式"""
+                        sid: str = "", umo: str = "",
+                        json_mode: bool = False) -> str | None:
+        """调用 LLM。json_mode=True 时强制 JSON 输出。"""
         try:
             if not umo and sid:
                 targets = self.plugin.state_mgr.select_notification_targets(
@@ -823,41 +824,18 @@ class TakeoverManager:
             if not provider_id:
                 return None
 
-            llm_resp = await context.llm_generate(
-                chat_provider_id=provider_id,
-                prompt=user_prompt,
-                system_prompt=system_prompt,
-            )
+            kwargs = {
+                "chat_provider_id": provider_id,
+                "prompt": user_prompt,
+                "system_prompt": system_prompt,
+            }
+            if json_mode:
+                kwargs["response_format"] = {"type": "json_object"}
+            llm_resp = await context.llm_generate(**kwargs)
             return llm_resp.completion_text.strip() or None
         except Exception as e:
-            logger.warning("[takeover] LLM call failed: %s", e)
-            return None
-
-    async def _call_llm_json(self, system_prompt: str, user_prompt: str,
-                             sid: str = "", umo: str = "") -> str | None:
-        """调用 LLM 并强制 JSON 输出"""
-        try:
-            if not umo and sid:
-                targets = self.plugin.state_mgr.select_notification_targets(
-                    sid, self.plugin.sessions_cache)
-                umo = targets[0] if targets else None
-            if not umo:
-                return None
-
-            context = self.plugin.context
-            provider_id = await context.get_current_chat_provider_id(umo=umo)
-            if not provider_id:
-                return None
-
-            llm_resp = await context.llm_generate(
-                chat_provider_id=provider_id,
-                prompt=user_prompt,
-                system_prompt=system_prompt,
-                response_format={"type": "json_object"},
-            )
-            return llm_resp.completion_text.strip() or None
-        except Exception as e:
-            logger.warning("[takeover] LLM JSON call failed: %s", e)
+            logger.warning("[takeover] LLM call failed (json=%s): %s",
+                           json_mode, e)
             return None
 
     # ════════════════════════════════════════
@@ -881,7 +859,8 @@ class TakeoverManager:
             task_title=task["title"],
             task_description=task["description"],
             response=response[:3000])
-        resp = await self._call_llm_json(prompts.EVALUATION_SYSTEM, user, sid=sid)
+        resp = await self._call_llm(prompts.EVALUATION_SYSTEM, user, sid=sid,
+                                     json_mode=True)
         if resp:
             parsed = self._parse_json(resp)
             if parsed:
