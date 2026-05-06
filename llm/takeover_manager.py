@@ -88,7 +88,13 @@ def _count_tasks(tasks: list[dict]) -> tuple[int, int]:
 
 
 def _format_plan_text(plan: dict, with_status: bool = True) -> str:
-    """格式化计划为可读文本"""
+    """格式化计划为可读文本。
+
+    显示规则：
+    - 父任务（有子任务）：渲染为分组标题 📂/📁，附带 (已完成数/总数)；不计入进度条
+    - 叶子任务：用 ⬜🔄✅❌⏭️ 表示状态，计入进度条 [N/M]
+    这样进度条 [N/M] 与可见的勾选项数一一对应。
+    """
     lines = []
     total, done = _count_tasks(plan["tasks"])
     pct = int(done / total * 100) if total > 0 else 0
@@ -103,19 +109,28 @@ def _format_plan_text(plan: dict, with_status: bool = True) -> str:
     def _fmt(tasks, indent=0):
         for t in tasks:
             prefix = "  " * indent
-            if with_status:
-                icons = {"pending": "⬜", "running": "🔄", "done": "✅",
-                         "failed": "❌", "skipped": "⏭️"}
-                icon = icons.get(t["status"], "⬜")
-                lines.append(f"{prefix}{icon} {t['title']}")
-                if t["result_summary"] and t["status"] in ("done", "failed"):
-                    lines.append(f"{prefix}   └ {t['result_summary']}")
-            else:
-                lines.append(f"{prefix}• {t['title']}")
-                if t["description"]:
-                    lines.append(f"{prefix}  {t['description'][:100]}")
             if t["subtasks"]:
+                # 父任务：分组标题（不计入 [N/M]）
+                sub_total, sub_done = _count_tasks(t["subtasks"])
+                folder_icon = "📁" if sub_done == sub_total else "📂"
+                lines.append(
+                    f"{prefix}{folder_icon} {t['title']} ({sub_done}/{sub_total})")
+                if not with_status and t.get("description"):
+                    lines.append(f"{prefix}  {t['description'][:100]}")
                 _fmt(t["subtasks"], indent + 1)
+            else:
+                # 叶子任务
+                if with_status:
+                    icons = {"pending": "⬜", "running": "🔄", "done": "✅",
+                             "failed": "❌", "skipped": "⏭️"}
+                    icon = icons.get(t["status"], "⬜")
+                    lines.append(f"{prefix}{icon} {t['title']}")
+                    if t["result_summary"] and t["status"] in ("done", "failed"):
+                        lines.append(f"{prefix}   └ {t['result_summary']}")
+                else:
+                    lines.append(f"{prefix}• {t['title']}")
+                    if t["description"]:
+                        lines.append(f"{prefix}  {t['description'][:100]}")
 
     _fmt(plan["tasks"])
     return "\n".join(lines)

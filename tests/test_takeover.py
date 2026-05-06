@@ -365,6 +365,42 @@ class TestDataModel:
         assert "0/3" in text
         assert "任务1" in text
         assert "任务2" in text
+        # 全叶子任务计划应该全部用 ⬜ 复选框，没有 📂/📁 分组图标
+        assert "📂" not in text
+        assert "📁" not in text
+        assert "⬜" in text
+
+    def test_format_plan_text_with_subtasks(self):
+        """父任务渲染为 📂/📁 分组标题，叶子用复选框，进度只数叶子。"""
+        sub1 = _create_task({"title": "子1.1", "description": "d"}, 0)
+        sub2 = _create_task({"title": "子1.2", "description": "d"}, 1)
+        sub1["status"] = "done"  # 一个完成
+        parent = _create_task({"title": "父任务1", "description": "d"}, 0)
+        parent["subtasks"] = [sub1, sub2]
+        leaf = _create_task({"title": "独立叶子", "description": "d"}, 1)
+        plan = make_plan(tasks=[parent, leaf])
+
+        text = _format_plan_text(plan)
+        # 父任务渲染为 📂（部分完成）+ 子任务计数
+        assert "📂 父任务1 (1/2)" in text
+        # 叶子还是用 ⬜
+        assert "⬜ 独立叶子" in text
+        # 进度数只数叶子：子1.1(done) + 子1.2(pending) + 独立叶子(pending) = 1/3
+        assert "1/3" in text
+
+    def test_format_plan_text_fully_completed_parent(self):
+        """父任务下所有子完成 → 父显示 📁（关闭文件夹）。"""
+        sub1 = _create_task({"title": "子1.1"}, 0)
+        sub2 = _create_task({"title": "子1.2"}, 1)
+        sub1["status"] = "done"
+        sub2["status"] = "skipped"  # done + skipped 都算完成
+        parent = _create_task({"title": "父任务"}, 0)
+        parent["subtasks"] = [sub1, sub2]
+        plan = make_plan(tasks=[parent])
+
+        text = _format_plan_text(plan)
+        assert "📁 父任务 (2/2)" in text
+        assert "📂" not in text  # 全完成不应显示打开文件夹
 
     def test_completed_summary(self):
         tasks = [
