@@ -150,6 +150,7 @@ def _format_response_for_evaluation(messages: list[dict],
     safety cap: format 后仍超 max_total，截首尾保留。
     """
     parts: list[str] = []
+    counter = {"edit": 0}  # Edit/MultiEdit/Write 累计序号，供 inspect_edits 引用
     for msg in sorted(messages, key=lambda m: m.get("seq", 0)):
         inner = msg.get("content", {}).get("content")
         if isinstance(inner, str):
@@ -157,11 +158,11 @@ def _format_response_for_evaluation(messages: list[dict],
                 parts.append(inner.strip())
         elif isinstance(inner, list):
             for block in inner:
-                t = _extract_block_for_eval(block)
+                t = _extract_block_for_eval(block, counter)
                 if t:
                     parts.append(t)
         elif isinstance(inner, dict):
-            t = _extract_block_for_eval(inner)
+            t = _extract_block_for_eval(inner, counter)
             if t:
                 parts.append(t)
 
@@ -181,8 +182,12 @@ def _format_response_for_evaluation(messages: list[dict],
     return joined
 
 
-def _extract_block_for_eval(block: dict) -> str | None:
-    """从单个 block 提取评估用文本。返回 None 表示丢弃。"""
+def _extract_block_for_eval(block: dict, counter: dict | None = None) -> str | None:
+    """从单个 block 提取评估用文本。返回 None 表示丢弃。
+
+    counter: 可变 dict，用于跨调用累计 Edit/Write/MultiEdit 编号。
+             形如 {"edit": int}。caller 不传则不编号（独立调用场景）。
+    """
     if not isinstance(block, dict):
         return None
     btype = block.get("type", "")
@@ -194,7 +199,7 @@ def _extract_block_for_eval(block: dict) -> str | None:
 
     # 工具调用：只保留动作摘要，不含具体内容
     if btype in ("tool_use", "tool-call"):
-        return _format_tool_call_for_eval(block)
+        return _format_tool_call_for_eval(block, counter)
 
     # final summary
     if btype == "summary":
@@ -214,9 +219,9 @@ def _extract_block_for_eval(block: dict) -> str | None:
     if btype in ("output", "input", "codex"):
         data = block.get("data")
         if isinstance(data, dict):
-            return _extract_block_for_eval(data)
+            return _extract_block_for_eval(data, counter)
         if isinstance(data, list):
-            sub = [_extract_block_for_eval(b) for b in data]
+            sub = [_extract_block_for_eval(b, counter) for b in data]
             sub_clean = [s for s in sub if s]
             return "\n".join(sub_clean) if sub_clean else None
         return None
@@ -225,8 +230,10 @@ def _extract_block_for_eval(block: dict) -> str | None:
     return None
 
 
-def _format_tool_call_for_eval(block: dict) -> str:
-    """工具调用 → 一行动作摘要，不含具体内容。"""
+def _format_tool_call_for_eval(block: dict, counter: dict | None = None) -> str:
+    """工具调用 → 一行动作摘要，不含具体内容。
+    Edit/MultiEdit/Write 会带 [E#] 前缀，供 LLM 评估时通过 inspect_edits 引用。
+    """
     name = block.get("name", "?")
     inp = block.get("input", {}) or {}
     if not isinstance(inp, dict):
@@ -242,6 +249,9 @@ def _format_tool_call_for_eval(block: dict) -> str:
     if name in ("Edit", "MultiEdit", "Write"):
         fp = inp.get("file_path", "?")
         base = fp.rsplit("/", 1)[-1] if "/" in fp else fp
+        if counter is not None:
+            counter["edit"] = counter.get("edit", 0) + 1
+            return f"🛠️ [E{counter['edit']}] {name}: {base}"
         return f"🛠️ {name}: {base}"
 
     if name == "Read":
@@ -265,6 +275,105 @@ def _format_tool_call_for_eval(block: dict) -> str:
         return f"🛠️ TodoWrite ({done}/{len(todos)} 完成)"
 
     return f"🛠️ {name}"
+
+
+def _iter_edit_blocks(messages: list[dict]):
+    """按 _format_response_for_evaluation 同样的顺序产出 Edit/MultiEdit/Write 块。
+    yield (index, name, input_dict)，index 从 1 开始。
+    """
+    idx = 0
+    for msg in sorted(messages, key=lambda m: m.get("seq", 0)):
+        inner = msg.get("content", {}).get("content")
+        blocks = []
+        if isinstance(inner, list):
+            blocks = inner
+        elif isinstance(inner, dict):
+            blocks = [inner]
+        for b in _flatten_blocks(blocks):
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") not in ("tool_use", "tool-call"):
+                continue
+            name = b.get("name", "")
+            if name not in ("Edit", "MultiEdit", "Write"):
+                continue
+            idx += 1
+            inp = b.get("input", {}) or {}
+            if isinstance(inp, dict):
+                yield idx, name, inp
+
+
+def _flatten_blocks(blocks: list) -> list:
+    """递归展开 output/input/codex 包装，返回扁平 block 列表。
+    与 _extract_block_for_eval 的递归路径保持一致以维持索引同步。
+    """
+    out = []
+    for b in blocks:
+        if not isinstance(b, dict):
+            out.append(b)
+            continue
+        btype = b.get("type", "")
+        if btype in ("output", "input", "codex"):
+            data = b.get("data")
+            if isinstance(data, list):
+                out.extend(_flatten_blocks(data))
+            elif isinstance(data, dict):
+                out.extend(_flatten_blocks([data]))
+        else:
+            out.append(b)
+    return out
+
+
+def _lookup_edit_details(messages: list[dict], indices: list[int],
+                         max_per_field: int = 800) -> str:
+    """根据 [E#] 索引返回指定编辑块的完整内容。
+
+    - Edit: file_path + old_string + new_string（各截断到 max_per_field）
+    - MultiEdit: file_path + 每条 sub-edit（前 5 条）
+    - Write: file_path + content (前 max_per_field 字)
+
+    indices 中找不到的索引会标"未找到"。
+    """
+    requested = set(int(i) for i in indices if isinstance(i, (int, str))
+                    and str(i).strip().isdigit())
+    if not requested:
+        return "（未指定有效的编辑索引）"
+
+    parts = []
+    found = set()
+    for idx, name, inp in _iter_edit_blocks(messages):
+        if idx not in requested:
+            continue
+        found.add(idx)
+        fp = inp.get("file_path", "?")
+        if name == "Edit":
+            old = (inp.get("old_string") or "")[:max_per_field]
+            new = (inp.get("new_string") or "")[:max_per_field]
+            parts.append(f"[E{idx}] Edit {fp}\n  -OLD:\n{old}\n  +NEW:\n{new}")
+        elif name == "MultiEdit":
+            edits = inp.get("edits") or []
+            lines = [f"[E{idx}] MultiEdit {fp} ({len(edits)} 处子编辑):"]
+            for j, e in enumerate(edits[:5]):
+                if not isinstance(e, dict):
+                    continue
+                old = (e.get("old_string") or "")[:300]
+                new = (e.get("new_string") or "")[:300]
+                lines.append(f"  #{j+1} -OLD: {old}")
+                lines.append(f"  #{j+1} +NEW: {new}")
+            if len(edits) > 5:
+                lines.append(f"  ...（还有 {len(edits)-5} 处省略）")
+            parts.append("\n".join(lines))
+        elif name == "Write":
+            content = (inp.get("content") or "")[:max_per_field]
+            line_count = (inp.get("content") or "").count("\n") + 1
+            parts.append(
+                f"[E{idx}] Write {fp} ({line_count} 行)\n  CONTENT:\n{content}")
+
+    missing = requested - found
+    if missing:
+        parts.append(f"（未找到的编辑索引: {sorted(missing)}）")
+
+    return "\n\n".join(parts) if parts else "（无匹配的编辑详情）"
 
 
 def _completed_summary(tasks: list[dict]) -> str:
@@ -854,13 +963,17 @@ class TakeoverManager:
         """HAPI 任务完成后的评估循环（由 sse_listener 调用）。
 
         response: 既可以是已格式化好的字符串（回退路径），也可以是 raw messages
-                  list[dict]。后者会用 _format_response_for_evaluation 启发式精简。
+                  list[dict]。后者会用 _format_response_for_evaluation 启发式精简
+                  并保留原始消息供 inspect_edits drill-down 使用。
         ctx_task_id: 注册回调时记录的 task_id，防止 cancel→新 plan 间隙的旧 completion
                      被错误评估到新任务。
         """
-        # raw messages → 启发式精简文本
+        # raw messages → 启发式精简文本，同时保留 raw 供 inspect_edits 使用
         if isinstance(response, list):
-            response = _format_response_for_evaluation(response)
+            raw_messages = response
+            response = _format_response_for_evaluation(raw_messages)
+        else:
+            raw_messages = None
 
         plan = self._plans.get(sid)
         if not plan:
@@ -881,8 +994,9 @@ class TakeoverManager:
         # 进度提示：评估也要调 LLM，几秒内会有结果
         await self._notify_user(sid, f"🔍 「{task['title']}」执行完毕，正在评估结果…")
 
-        # 调用 LLM 评估
-        evaluation = await self._evaluate_task(sid, plan, task, response)
+        # 调用 LLM 评估（raw_messages 支持 inspect_edits drill-down）
+        evaluation = await self._evaluate_task(sid, plan, task, response,
+                                                raw_messages=raw_messages)
 
         # 更新��务状态
         task["status"] = evaluation.get("task_status", "done")
@@ -1034,20 +1148,69 @@ class TakeoverManager:
             task_description=task["description"])
         return await self._call_llm(prompts.INSTRUCTION_SYSTEM, user, sid=sid)
 
-    async def _evaluate_task(self, sid: str, plan: dict, task: dict, response: str) -> dict:
+    async def _evaluate_task(self, sid: str, plan: dict, task: dict,
+                             response: str,
+                             raw_messages: list[dict] | None = None,
+                             max_inspections: int = 2) -> dict:
+        """LLM 评估任务结果。支持 inspect_edits 多轮 drill-down。
+
+        raw_messages: 原始消息列表（含 Edit/Write 完整 input），用于响应
+                       inspect_edits 请求。None 时不允许 inspect。
+        max_inspections: inspect_edits 最多生效次数。
+        """
         plan_summary = _format_plan_text(plan, with_status=True)
-        user = prompts.EVALUATION_USER.format(
+        base_user = prompts.EVALUATION_USER.format(
             goal=plan["goal"],
             plan_summary=plan_summary,
             task_title=task["title"],
             task_description=task["description"],
             response=response)
-        resp = await self._call_llm(prompts.EVALUATION_SYSTEM, user, sid=sid,
-                                     json_mode=True)
-        if resp:
-            parsed = self._parse_json(resp)
-            if parsed:
-                return parsed
+
+        inspections_done = 0
+        extra_context = ""
+
+        while True:
+            resp = await self._call_llm(
+                prompts.EVALUATION_SYSTEM,
+                base_user + extra_context,
+                sid=sid, json_mode=True)
+            parsed = self._parse_json(resp) if resp else None
+            if not parsed:
+                break  # 解析失败 → 走 fallback
+
+            # inspect_edits drill-down 路径
+            wants_inspect = parsed.get("next_action") == "inspect_edits"
+            indices = parsed.get("inspect_edit_indices") or []
+            if (wants_inspect and raw_messages
+                    and isinstance(indices, list) and indices
+                    and inspections_done < max_inspections):
+                details = _lookup_edit_details(raw_messages, indices)
+                inspections_done += 1
+                remaining = max_inspections - inspections_done
+                extra_context = (
+                    f"\n\n=== 编辑详情（第 {inspections_done}/"
+                    f"{max_inspections} 次查看）===\n{details}\n\n"
+                    f"剩余查看次数: {remaining}。请基于以上详情给出最终判断。"
+                    + (" 不要再请求 inspect_edits。" if remaining == 0 else ""))
+                logger.info(
+                    "[takeover] evaluation inspecting edits %s (round %d)",
+                    indices, inspections_done)
+                continue
+
+            # budget 用尽但 LLM 仍要求 inspect：把 next_action 修正为 continue
+            if wants_inspect:
+                logger.warning(
+                    "[takeover] evaluation still requests inspect_edits "
+                    "(done=%d budget=%d), forcing continue",
+                    inspections_done, max_inspections)
+                parsed["next_action"] = "continue"
+                if not parsed.get("task_status"):
+                    parsed["task_status"] = "done"
+                if not parsed.get("task_summary"):
+                    parsed["task_summary"] = "（评估器请求查看更多细节，预算耗尽，按 continue 处理）"
+
+            return parsed
+
         # 解析失败时的安全默认值
         logger.warning("[takeover] evaluation parse failed, defaulting to done+continue")
         return {

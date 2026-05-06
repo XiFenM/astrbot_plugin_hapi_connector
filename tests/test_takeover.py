@@ -113,6 +113,7 @@ _insert_after = _tm_mod._insert_after
 _count_tasks = _tm_mod._count_tasks
 _format_response_for_evaluation = _tm_mod._format_response_for_evaluation
 _extract_block_for_eval = _tm_mod._extract_block_for_eval
+_lookup_edit_details = _tm_mod._lookup_edit_details
 _format_plan_text = _tm_mod._format_plan_text
 _completed_summary = _tm_mod._completed_summary
 _create_task = _tm_mod._create_task
@@ -178,14 +179,29 @@ class FakeSSEListener:
 
 class FakeContext:
     def __init__(self, llm_response=None):
-        self._llm_response = llm_response
+        # llm_response 既可是 str（单轮），也可是 list[str]（多轮队列，按序消费）
+        if isinstance(llm_response, list):
+            self._queue = list(llm_response)
+            self._single = None
+            self._has_provider = bool(self._queue)
+        else:
+            self._queue = None
+            self._single = llm_response
+            self._has_provider = llm_response is not None
+        self.calls = 0
 
     async def get_current_chat_provider_id(self, umo=None):
-        return "test_provider" if self._llm_response else None
+        return "test_provider" if self._has_provider else None
 
     async def llm_generate(self, **kwargs):
+        self.calls += 1
+        if self._queue is not None:
+            text = self._queue.pop(0) if self._queue else None
+        else:
+            text = self._single
+
         class Resp:
-            completion_text = self._llm_response
+            completion_text = text
         return Resp()
 
 
@@ -1348,3 +1364,223 @@ class TestCancelAbort:
         await mgr.control("sid_001", "cancel")
 
         assert plan["awaiting_response_since"] is None
+
+
+# ════════════════════════════════════════════════════════════════
+# Edit drill-down: [E#] 索引 + _lookup_edit_details + inspect_edits 循环
+# ════════════════════════════════════════════════════════════════
+
+
+class TestEditIndexAndLookup:
+    """Edit/Write/MultiEdit 加序号 + 详情查找。"""
+
+    def _msg(self, blocks, seq=1):
+        return {"seq": seq, "content": {"role": "assistant", "content": blocks}}
+
+    def test_edit_blocks_get_indexed(self):
+        """Edit/MultiEdit/Write 在 formatter 中按顺序加 [E#] 前缀，Read/Bash 不加。"""
+        msgs = [self._msg([
+            {"type": "tool_use", "name": "Edit",
+             "input": {"file_path": "/p/a.py",
+                       "old_string": "x", "new_string": "y"}},
+            {"type": "tool_use", "name": "Read",
+             "input": {"file_path": "/p/b.py"}},
+            {"type": "tool_use", "name": "Write",
+             "input": {"file_path": "/p/c.py", "content": "..."}},
+            {"type": "tool_use", "name": "Bash",
+             "input": {"command": "ls"}},
+            {"type": "tool_use", "name": "MultiEdit",
+             "input": {"file_path": "/p/d.py",
+                       "edits": [{"old_string": "1", "new_string": "2"}]}},
+        ])]
+        result = _format_response_for_evaluation(msgs)
+        assert "[E1] Edit" in result and "a.py" in result
+        assert "[E2] Write" in result and "c.py" in result
+        assert "[E3] MultiEdit" in result and "d.py" in result
+        # Read / Bash 不带 [E#]
+        assert "Read: b.py" in result and "[E" not in result.split("Read")[1].split("\n")[0]
+        assert "Bash: ls" in result
+
+    def test_lookup_edit_returns_full_old_new(self):
+        msgs = [self._msg([
+            {"type": "tool_use", "name": "Edit",
+             "input": {"file_path": "/p/auth.py",
+                       "old_string": "TOKEN='hardcoded_secret'",
+                       "new_string": "TOKEN=os.environ['AUTH_TOKEN']"}},
+        ])]
+        details = _lookup_edit_details(msgs, [1])
+        assert "[E1]" in details
+        assert "auth.py" in details
+        # OLD 和 NEW 完整内容都要在
+        assert "hardcoded_secret" in details
+        assert "os.environ['AUTH_TOKEN']" in details
+
+    def test_lookup_multiedit_returns_each_subedit(self):
+        msgs = [self._msg([
+            {"type": "tool_use", "name": "MultiEdit",
+             "input": {"file_path": "/p/m.py",
+                       "edits": [
+                           {"old_string": "alpha_OLD", "new_string": "alpha_NEW"},
+                           {"old_string": "beta_OLD", "new_string": "beta_NEW"},
+                       ]}},
+        ])]
+        details = _lookup_edit_details(msgs, [1])
+        assert "MultiEdit" in details
+        assert "alpha_OLD" in details and "alpha_NEW" in details
+        assert "beta_OLD" in details and "beta_NEW" in details
+
+    def test_lookup_write_returns_content(self):
+        msgs = [self._msg([
+            {"type": "tool_use", "name": "Write",
+             "input": {"file_path": "/p/w.py",
+                       "content": "WRITE_MARKER_CONTENT\nline2"}},
+        ])]
+        details = _lookup_edit_details(msgs, [1])
+        assert "Write" in details and "w.py" in details
+        assert "WRITE_MARKER_CONTENT" in details
+
+    def test_lookup_unknown_index_reports_missing(self):
+        msgs = [self._msg([
+            {"type": "tool_use", "name": "Edit",
+             "input": {"file_path": "/p/a.py",
+                       "old_string": "x", "new_string": "y"}},
+        ])]
+        details = _lookup_edit_details(msgs, [5])
+        assert "未找到" in details
+
+    def test_lookup_no_indices_returns_empty(self):
+        msgs = [self._msg([
+            {"type": "tool_use", "name": "Edit",
+             "input": {"file_path": "/p/a.py",
+                       "old_string": "x", "new_string": "y"}},
+        ])]
+        details = _lookup_edit_details(msgs, [])
+        assert "未指定有效" in details
+
+    def test_lookup_index_skips_non_edit_tools(self):
+        """索引按 Edit/Write/MultiEdit 顺序累计，跳过 Read/Bash。"""
+        msgs = [self._msg([
+            {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+            {"type": "tool_use", "name": "Edit",
+             "input": {"file_path": "/p/a.py",
+                       "old_string": "FIRST_EDIT", "new_string": "y"}},
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "/p/x.py"}},
+            {"type": "tool_use", "name": "Edit",
+             "input": {"file_path": "/p/b.py",
+                       "old_string": "SECOND_EDIT", "new_string": "z"}},
+        ])]
+        # [E1] 应该是第一个 Edit (FIRST_EDIT) 而不是 Bash
+        details = _lookup_edit_details(msgs, [1])
+        assert "FIRST_EDIT" in details
+        assert "SECOND_EDIT" not in details
+        details2 = _lookup_edit_details(msgs, [2])
+        assert "SECOND_EDIT" in details2
+
+
+@pytest.mark.asyncio
+class TestEvaluateTaskInspect:
+    """_evaluate_task 多轮 inspect_edits drill-down。"""
+
+    def _make_inspect_setup(self, llm_responses):
+        """返回 (mgr, plan, raw_msgs)。"""
+        plugin = FakePlugin(llm_response=llm_responses)
+        mgr = TakeoverManager(plugin)
+        plan = make_plan(status="executing")
+        plan["current_task_id"] = plan["tasks"][0]["id"]
+        plan["tasks"][0]["status"] = "running"
+        mgr._plans["sid_001"] = plan
+        raw_msgs = [{
+            "seq": 1,
+            "content": {"role": "assistant", "content": [
+                {"type": "tool_use", "name": "Edit",
+                 "input": {"file_path": "/p/a.py",
+                           "old_string": "MARKER_OLD",
+                           "new_string": "MARKER_NEW"}},
+            ]}
+        }]
+        return plugin, mgr, plan, raw_msgs
+
+    async def test_inspect_edits_then_final_verdict(self):
+        """LLM 第一轮请求 inspect [1]，第二轮给最终判断。"""
+        llm_seq = [
+            json.dumps({
+                "next_action": "inspect_edits",
+                "inspect_edit_indices": [1],
+                "reasoning": "需要看具体改动",
+            }),
+            json.dumps({
+                "task_status": "done",
+                "task_summary": "改完了",
+                "goal_achieved": False,
+                "next_action": "continue",
+                "reasoning": "Edit 内容合理",
+            }),
+        ]
+        plugin, mgr, plan, raw_msgs = self._make_inspect_setup(llm_seq)
+        result = await mgr._evaluate_task(
+            "sid_001", plan, plan["tasks"][0],
+            "(formatted text)", raw_messages=raw_msgs)
+
+        assert result["next_action"] == "continue"
+        assert result["task_status"] == "done"
+        assert plugin.context.calls == 2  # 一次 inspect + 一次最终
+
+    async def test_inspect_budget_capped_at_2(self):
+        """LLM 一直请求 inspect，超 2 次后强制返回 continue。"""
+        llm_seq = [
+            json.dumps({"next_action": "inspect_edits",
+                        "inspect_edit_indices": [1]})
+        ] * 4
+        plugin, mgr, plan, raw_msgs = self._make_inspect_setup(llm_seq)
+        result = await mgr._evaluate_task(
+            "sid_001", plan, plan["tasks"][0],
+            "(formatted)", raw_messages=raw_msgs, max_inspections=2)
+
+        # 调 3 次：第 1、2 次消耗 inspect 预算，第 3 次仍 inspect → 强制 continue
+        assert plugin.context.calls == 3
+        assert result["next_action"] == "continue"
+
+    async def test_inspect_without_raw_messages_falls_through(self):
+        """raw_messages=None 时 inspect_edits 直接当结果用，不进 drill-down。"""
+        llm_seq = [json.dumps({
+            "next_action": "inspect_edits",
+            "inspect_edit_indices": [1],
+        })]
+        plugin, mgr, plan, _ = self._make_inspect_setup(llm_seq)
+        result = await mgr._evaluate_task(
+            "sid_001", plan, plan["tasks"][0],
+            "(formatted)", raw_messages=None)
+
+        assert plugin.context.calls == 1
+        assert result["next_action"] == "continue"
+
+    async def test_inspect_with_empty_indices_falls_through(self):
+        """LLM 说要 inspect 但 indices 列表空 → 当普通响应处理。"""
+        llm_seq = [json.dumps({
+            "next_action": "inspect_edits",
+            "inspect_edit_indices": [],
+        })]
+        plugin, mgr, plan, raw_msgs = self._make_inspect_setup(llm_seq)
+        result = await mgr._evaluate_task(
+            "sid_001", plan, plan["tasks"][0],
+            "(formatted)", raw_messages=raw_msgs)
+
+        assert plugin.context.calls == 1
+        assert result["next_action"] == "continue"  # 强制为 continue
+
+    async def test_normal_evaluation_no_inspect_takes_one_call(self):
+        """正常评估不需要 inspect 时只调 LLM 一次。"""
+        llm_seq = [json.dumps({
+            "task_status": "done",
+            "task_summary": "OK",
+            "goal_achieved": True,
+            "next_action": "complete",
+            "reasoning": "看起来好了",
+        })]
+        plugin, mgr, plan, raw_msgs = self._make_inspect_setup(llm_seq)
+        result = await mgr._evaluate_task(
+            "sid_001", plan, plan["tasks"][0],
+            "(formatted)", raw_messages=raw_msgs)
+
+        assert plugin.context.calls == 1
+        assert result["next_action"] == "complete"
