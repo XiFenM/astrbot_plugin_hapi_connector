@@ -104,6 +104,97 @@ async def fetch_session_models(client: AsyncHapiClient, sid: str) -> dict:
     return data
 
 
+async def set_session_effort(client: AsyncHapiClient, sid: str,
+                             effort: str | None) -> tuple[bool, str]:
+    """设置 Claude session 的 effort。effort=None 表示恢复 auto/默认。"""
+    resp = await client.post(f"/api/sessions/{sid}/effort", json={"effort": effort})
+    if resp.ok:
+        resp.release()
+        label = effort if effort else "auto"
+        return True, f"Claude effort 已切换为: {label}"
+    body = await resp.text()
+    resp.release()
+    return False, f"切换失败: {resp.status} {body[:200]}"
+
+
+async def set_session_reasoning_effort(client: AsyncHapiClient, sid: str,
+                                       effort: str | None) -> tuple[bool, str]:
+    """设置 Codex session 的 modelReasoningEffort。effort=None 表示恢复默认。"""
+    resp = await client.post(
+        f"/api/sessions/{sid}/model-reasoning-effort",
+        json={"modelReasoningEffort": effort},
+    )
+    if resp.ok:
+        resp.release()
+        label = effort if effort else "default"
+        return True, f"Codex reasoning effort 已切换为: {label}"
+    body = await resp.text()
+    resp.release()
+    return False, f"切换失败: {resp.status} {body[:200]}"
+
+
+def _extract_usage(content: dict) -> dict | None:
+    """从 HAPI 消息 content 里抽出 Claude 的 usage 对象（兼容 message 包装层）。"""
+    if not isinstance(content, dict):
+        return None
+    usage = content.get("usage")
+    if isinstance(usage, dict):
+        return usage
+    inner = content.get("message")
+    if isinstance(inner, dict):
+        usage = inner.get("usage")
+        if isinstance(usage, dict):
+            return usage
+    return None
+
+
+def aggregate_token_usage(messages: list[dict]) -> dict:
+    """从消息列表里抽取 token 用量统计。
+
+    Claude 的 usage 字段（input_tokens、cache_read_input_tokens、output_tokens 等）
+    挂在每条 assistant 消息内，每次调用都会带上当时的全量 input。因此：
+    - 当前上下文规模 ≈ 最新一条 assistant 消息的 input_tokens（含 cache_read）
+    - 累计输出 ≈ 所有 assistant 消息 output_tokens 之和
+
+    返回: {has_data, latest_input, latest_cached, latest_output, latest_seq,
+            cumulative_output, samples}
+    samples 表示参与统计的消息条数。
+    """
+    latest_seq = -1
+    latest_input = 0
+    latest_cached = 0
+    latest_output = 0
+    cumulative_output = 0
+    samples = 0
+
+    for m in messages:
+        usage = _extract_usage(m.get("content", {}))
+        if not usage:
+            continue
+        samples += 1
+        out = int(usage.get("output_tokens", 0) or 0)
+        cumulative_output += out
+
+        seq = m.get("seq", -1) or -1
+        if seq > latest_seq:
+            latest_seq = seq
+            latest_input = int(usage.get("input_tokens", 0) or 0)
+            cache_read = int(usage.get("cache_read_input_tokens", 0) or 0)
+            cache_create = int(usage.get("cache_creation_input_tokens", 0) or 0)
+            latest_cached = cache_read + cache_create
+            latest_output = out
+
+    return {
+        "has_data": samples > 0,
+        "latest_input": latest_input,
+        "latest_cached": latest_cached,
+        "latest_output": latest_output,
+        "latest_seq": latest_seq,
+        "cumulative_output": cumulative_output,
+        "samples": samples,
+    }
+
+
 async def compact_session(client: AsyncHapiClient, sid: str) -> tuple[bool, str]:
     """触发 session 的上下文压缩"""
     resp = await client.post(f"/api/sessions/{sid}/compact", json={})

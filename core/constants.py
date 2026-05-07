@@ -38,6 +38,9 @@ CODEX_REASONING_EFFORT_OPTIONS = [
 ]
 CODEX_REASONING_EFFORT_VALUES = [value for value, _ in CODEX_REASONING_EFFORT_OPTIONS if value]
 
+# Claude 思考深度；与 HAPI Web UI 选项对齐。"default"/"auto" 在 API 层映射为 null
+CLAUDE_EFFORT_VALUES = ["low", "medium", "high", "xhigh", "max"]
+
 # 支持的 Agent 类型
 AGENTS = ["claude", "codex", "gemini", "opencode"]
 

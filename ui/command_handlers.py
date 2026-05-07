@@ -46,6 +46,8 @@ class CommandHandlers:
             "sw": (self.cmd_sw, True),
             "s": (self.cmd_status, False),
             "status": (self.cmd_status, False),
+            "info": (self.cmd_info, False),
+            "effort": (self.cmd_effort, True),
             "msg": (self.cmd_msg, True),
             "messages": (self.cmd_msg, True),
             "to": (self.cmd_to, True),
@@ -263,6 +265,97 @@ class CommandHandlers:
             yield event.plain_result(text)
         except Exception as e:
             yield event.plain_result(f"获取状态失败: {e}")
+
+    # ── info ──
+
+    async def cmd_info(self, event: AstrMessageEvent):
+        """聚合展示当前 session 的运行参数与 token 用量"""
+        import asyncio
+        await self.state_mgr.ensure_primary_session(event)
+        await self.state_mgr.set_user_state(event)
+        sid = self.state_mgr.effective_sid(event)
+        if not sid:
+            yield event.plain_result("请先用 /hapi sw <序号> 选择一个 session")
+            return
+        try:
+            detail_task = session_ops.fetch_session_detail(self.client, sid)
+            models_task = session_ops.fetch_session_models(self.client, sid)
+            messages_task = session_ops.fetch_messages(self.client, sid, limit=200)
+            detail, models, messages = await asyncio.gather(
+                detail_task, models_task, messages_task,
+                return_exceptions=True,
+            )
+        except Exception as e:
+            yield event.plain_result(f"获取 info 失败: {e}")
+            return
+
+        if isinstance(detail, Exception):
+            yield event.plain_result(f"获取 session 详情失败: {detail}")
+            return
+        models_dict = models if isinstance(models, dict) else None
+        msgs_list = messages if isinstance(messages, list) else []
+        usage = session_ops.aggregate_token_usage(msgs_list) if msgs_list else None
+
+        text = formatters.format_session_info(detail, models_dict, usage)
+        yield event.plain_result(text)
+
+    # ── effort ──
+
+    async def cmd_effort(self, event: AstrMessageEvent, level: str = ""):
+        """查看或切换 effort（Claude）/ reasoning effort（Codex）"""
+        from ..core.constants import CLAUDE_EFFORT_VALUES, CODEX_REASONING_EFFORT_VALUES
+        await self.state_mgr.set_user_state(event)
+        sid = self.state_mgr.effective_sid(event)
+        if not sid:
+            yield event.plain_result("请先用 /hapi sw <序号> 选择一个 session")
+            return
+
+        try:
+            detail = await session_ops.fetch_session_detail(self.client, sid)
+        except Exception as e:
+            yield event.plain_result(f"获取 session 详情失败: {e}")
+            return
+        flavor = (detail.get("metadata", {}) or {}).get("flavor", "?")
+
+        if flavor == "claude":
+            field = "effort"
+            current = detail.get("effort")
+            allowed = CLAUDE_EFFORT_VALUES
+            reset_aliases = {"auto", "default"}
+        elif flavor == "codex":
+            field = "modelReasoningEffort"
+            current = detail.get("modelReasoningEffort")
+            allowed = CODEX_REASONING_EFFORT_VALUES
+            reset_aliases = {"default"}
+        else:
+            yield event.plain_result(f"⚠️ 当前 flavor={flavor} 不支持 effort 设置")
+            return
+
+        normalized = (level or "").strip().lower()
+
+        if not normalized:
+            label = current if current else "(未设置/默认)"
+            choices = ", ".join(allowed) + (" 或 " + " / ".join(reset_aliases))
+            yield event.plain_result(
+                f"当前 {field}: {label}\n可选值: {choices}\n用法: /hapi effort <level>"
+            )
+            return
+
+        if normalized in reset_aliases:
+            target: str | None = None
+        elif normalized in allowed:
+            target = normalized
+        else:
+            yield event.plain_result(
+                f"❌ 无效 level: {normalized}\n可选: {', '.join(allowed)} 或 {' / '.join(reset_aliases)}"
+            )
+            return
+
+        if flavor == "claude":
+            ok, msg = await session_ops.set_session_effort(self.client, sid, target)
+        else:
+            ok, msg = await session_ops.set_session_reasoning_effort(self.client, sid, target)
+        yield event.plain_result(msg)
 
     # ── msg ──
 

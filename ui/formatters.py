@@ -465,6 +465,67 @@ def format_session_status(s: dict) -> str:
     return "\n".join(lines)
 
 
+def format_session_info(detail: dict, models: dict | None,
+                        usage: dict | None) -> str:
+    """聚合展示当前 session 的运行参数与 token 用量。
+
+    detail: fetch_session_detail 返回；models: fetch_session_models 返回；
+    usage: aggregate_token_usage 返回。任一为 None 表示该部分不可用。
+    """
+    meta = detail.get("metadata", {}) or {}
+    sid = detail.get("id", "?")
+    flavor = meta.get("flavor", "?")
+    summary = (meta.get("summary") or {}).get("text", "(无标题)")
+    path = meta.get("path", "?")
+    perm = detail.get("permissionMode", "default")
+    active = detail.get("active", False)
+    thinking = detail.get("thinking", False)
+
+    # 模型：优先用 fetch_session_models 的 currentModel（更准），否则 detail.modelMode
+    if models and models.get("currentModel"):
+        model_label = models.get("currentModel")
+    else:
+        model_label = detail.get("modelMode") or "default"
+
+    # effort：Claude 看 detail.effort；Codex 看 detail.modelReasoningEffort
+    effort_line = ""
+    if flavor == "claude":
+        effort = detail.get("effort")
+        effort_line = f"Effort:    {effort if effort else 'auto'}\n"
+    elif flavor == "codex":
+        effort = detail.get("modelReasoningEffort")
+        effort_line = f"Reasoning: {effort if effort else 'default'}\n"
+
+    out = (
+        f"📋 Session 信息 ({sid[:8]})\n"
+        f"标题:     {summary}\n"
+        f"Flavor:   {flavor}\n"
+        f"Path:     {path}\n"
+        f"Active:   {active}\n"
+        f"Thinking: {thinking}\n"
+        f"权限模式: {perm}\n"
+        f"模型:     {model_label}\n"
+        f"{effort_line}"
+    )
+
+    if usage and usage.get("has_data"):
+        latest_input = usage.get("latest_input", 0)
+        latest_cached = usage.get("latest_cached", 0)
+        latest_output = usage.get("latest_output", 0)
+        cumulative = usage.get("cumulative_output", 0)
+        samples = usage.get("samples", 0)
+        out += (
+            f"\n📊 Token 用量（基于最近 {samples} 条 assistant 消息）\n"
+            f"上次 input:  {latest_input:,} (含 cached {latest_cached:,})\n"
+            f"上次 output: {latest_output:,}\n"
+            f"累计 output: {cumulative:,}\n"
+        )
+    else:
+        out += "\n📊 Token 用量: 暂无（需更多消息或非 Claude 会话）\n"
+
+    return out
+
+
 def format_capabilities(caps: dict, sid: str) -> str:
     """格式化会话能力配置"""
     lines = [f"📋 会话能力配置 ({sid[:8]})"]
@@ -850,6 +911,8 @@ KNOWN_HAPI_SUBCOMMANDS = {
     "list", "ls",
     "sw",
     "s", "status",
+    "info",
+    "effort",
     "msg", "messages",
     "to",
     "perm",
@@ -939,6 +1002,20 @@ HELP_COMMANDS = [
         "usage": "/hapi s",
         "summary": "查看当前 session 状态（未绑定时回退默认窗口）",
         "example": None,
+        "home": False,
+    },
+    {
+        "topic": "session",
+        "usage": "/hapi info",
+        "summary": "聚合展示模型、effort、权限模式、token 用量等运行参数",
+        "example": None,
+        "home": False,
+    },
+    {
+        "topic": "session",
+        "usage": "/hapi effort [level]",
+        "summary": "查看或调整思考深度。Claude: low/medium/high/xhigh/max/auto；Codex: low/medium/high/xhigh/default",
+        "example": "/hapi effort medium",
         "home": False,
     },
     {
